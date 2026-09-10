@@ -6,6 +6,13 @@ import traceback
 
 
 def check_valid(mode: ExecutionMode, curr_statistics: dict, min_runtime: int = 100, verbose=True) -> bool:
+    query_error = curr_statistics.get('query_error')
+    if query_error:
+        if verbose:
+            print(f"Invalid because query execution failed "
+                  f"({query_error.get('error_type', 'database error')})")
+        return False
+
     # Timeouts are also a valid signal in learning
     if 'timeout' in curr_statistics and curr_statistics['timeout']:
         if verbose:

@@ -1,1 +1,9 @@
 .venv
+__pycache__/
+pg_lcm/
+examples/
+data/
+.env.bak
+REPRODUCTION_REPORT.md
+HEPATITIS_COLLECTION.md
+src/.pytest_cache/

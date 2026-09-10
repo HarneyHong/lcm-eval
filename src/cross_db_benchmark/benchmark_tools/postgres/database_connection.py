@@ -154,6 +154,7 @@ class PostgresDatabaseConnection(DatabaseConnection):
         verbose_plan = None
         hint_notices = None
         timeout = False
+        query_error = None
 
         if mode == ExecutionMode.JSON_OUTPUT:
             analyze_query = "(analyze true, format json)"
@@ -180,14 +181,15 @@ class PostgresDatabaseConnection(DatabaseConnection):
             timeout = True
             print(f"Hit the timeout for query: {sql}")
 
-        except psycopg2.errors.UndefinedFunction:
-            print(f"No operator matches the given name and argument types for {sql}")
-
-        except psycopg2.errors.SyntaxError:
-            print("Invalid due to Syntax error")
-
-        except psycopg2.errors.InvalidTextRepresentation:
-            print("Invalid due to Invalid text error")
+        except (psycopg2.ProgrammingError, psycopg2.DataError) as e:
+            # Workload generators can occasionally emit malformed predicates
+            # (for example, `BETWEEN nan AND nan` or an unescaped apostrophe).
+            # Record such statement-level failures as invalid queries so one bad
+            # query does not abort collection of the remaining workload.
+            query_error = dict(error_type=type(e).__name__,
+                               message=str(e).strip(),
+                               pgcode=e.pgcode)
+            print(f"Invalid SQL ({query_error['error_type']}): {query_error['message']}")
 
         if hint_notices and hint_validation:
             self.validate_hint_execution(hint_notices, sql)
@@ -195,7 +197,8 @@ class PostgresDatabaseConnection(DatabaseConnection):
         return dict(analyze_plans=analyze_plans,
                     verbose_plan=verbose_plan,
                     timeout=timeout,
-                    hint_notices=hint_notices)
+                    hint_notices=hint_notices,
+                    query_error=query_error)
 
     def validate_hint_execution(self, hint_notices: str, sql: str) -> None:
         original_hint = sql.split("*/")[0].strip(" ").strip("/*+ ")
@@ -269,21 +272,27 @@ class PostgresDatabaseConnection(DatabaseConnection):
 
     def get_result(self, sql: str, include_column_names: bool = False, db_created: bool = True,
                    include_hint_notices: bool = False, mode: ExecutionMode = ExecutionMode.RAW_OUTPUT):
-        connection, cursor = self.get_cursor(db_created=db_created)
-        cursor.execute(sql)
-        records = cursor.fetchall()
-        self.close_conn(connection, cursor)
-        if include_column_names:
-            return [desc[0] for desc in cursor.description], records
+        connection = None
+        cursor = None
+        try:
+            connection, cursor = self.get_cursor(db_created=db_created)
+            cursor.execute(sql)
+            records = cursor.fetchall()
 
-        if include_hint_notices:
-            assert connection.notices, f"No hint logs found during execution of {sql}"
-            return connection.notices, records
+            if include_column_names:
+                column_names = [desc[0] for desc in cursor.description]
+                return column_names, records
 
-        if mode == ExecutionMode.JSON_OUTPUT:
-            return records[0][0][0]
-        else:
+            if include_hint_notices:
+                notices = list(connection.notices)
+                assert notices, f"No hint logs found during execution of {sql}"
+                return notices, records
+
+            if mode == ExecutionMode.JSON_OUTPUT:
+                return records[0][0][0]
             return records
+        finally:
+            self.close_conn(connection, cursor)
 
     def get_cursor(self, db_created=True):
         if db_created:
@@ -301,6 +310,7 @@ class PostgresDatabaseConnection(DatabaseConnection):
         self.close_conn(connection, cursor)
 
     def close_conn(self, connection, cursor):
-        if connection:
+        if cursor:
             cursor.close()
+        if connection:
             connection.close()

@@ -65,7 +65,35 @@ class PredicateNode:
             literal = None
             column = None
             filter_feature = 0
+
+            # PostgreSQL >= 15 folds OR-chains of same-column comparisons into ANY
+            # expressions (e.g. "x >= a OR x >= b" -> "x >= ANY ('{a,b}'::integer[])"),
+            # which are emitted in the plan text. Parse these generically instead of
+            # mis-interpreting the array literal as a column name.
+            if ' ANY ' in self.text:
+                left, right = self.text.split(' ANY ', 1)
+                any_op_match = re.match(r'^(.*?)\s*(>=|<=|<>|>|<|=)\s*$', left)
+                # Equality ANY is already handled by the original '= ANY'
+                # branch below, which obtains the real column name from the
+                # expression child.  Handling it here would mistake the cast
+                # suffix (for example ``::text``) for the column name.
+                if any_op_match is not None and any_op_match.group(2) != '=':
+                    op_str = any_op_match.group(2)
+                    node_op = Operator.IN if op_str == '=' else {
+                        '>=': Operator.GEQ,
+                        '>': Operator.GEQ,
+                        '<=': Operator.LEQ,
+                        '<': Operator.LEQ,
+                        '<>': Operator.NEQ,
+                    }[op_str]
+                    column = any_op_match.group(1).strip()
+                    literal = right.strip().strip('()').strip()
+                    filter_feature = literal.count(',')
+                    self.children = []
+
             for op_rep, op in repr_op:
+                if node_op is not None:
+                    break
                 split_str = f' {op_rep} '
                 self.text = self.text + ' '
 

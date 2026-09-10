@@ -3,8 +3,8 @@
 DROP TABLE IF EXISTS "Bio";
 
 CREATE TABLE "Bio" (
-  "fibros" varchar(45) ,
-  "activity" varchar(45) ,
+  "fibros" integer ,
+  "activity" integer ,
   "b_id" integer ,
   PRIMARY KEY ("b_id")
 ) ;
@@ -13,25 +13,25 @@ DROP TABLE IF EXISTS "dispat";
 
 CREATE TABLE "dispat" (
   "m_id" integer  DEFAULT 0,
-  "sex" varchar(45) DEFAULT NULL,
-  "age" varchar(45) DEFAULT NULL,
-  "Type" varchar(45) DEFAULT NULL,
+  "sex" integer DEFAULT NULL,
+  "age" integer DEFAULT NULL,
+  "Type" integer DEFAULT NULL,
   PRIMARY KEY ("m_id")
 ) ;
 
 DROP TABLE IF EXISTS "indis";
 
 CREATE TABLE "indis" (
-  "got" varchar(10) DEFAULT NULL,
-  "gpt" varchar(10) DEFAULT NULL,
-  "alb" varchar(45) DEFAULT NULL,
-  "tbil" varchar(45) DEFAULT NULL,
-  "dbil" varchar(45) DEFAULT NULL,
-  "che" varchar(45) DEFAULT NULL,
-  "ttt" varchar(45) DEFAULT NULL,
-  "ztt" varchar(45) DEFAULT NULL,
-  "tcho" varchar(45) DEFAULT NULL,
-  "tp" varchar(45) DEFAULT NULL,
+  "got" integer DEFAULT NULL,
+  "gpt" integer DEFAULT NULL,
+  "alb" integer DEFAULT NULL,
+  "tbil" integer DEFAULT NULL,
+  "dbil" integer DEFAULT NULL,
+  "che" integer DEFAULT NULL,
+  "ttt" integer DEFAULT NULL,
+  "ztt" integer DEFAULT NULL,
+  "tcho" integer DEFAULT NULL,
+  "tp" integer DEFAULT NULL,
   "in_id" integer ,
   PRIMARY KEY ("in_id")
 ) ;
@@ -39,7 +39,7 @@ CREATE TABLE "indis" (
 DROP TABLE IF EXISTS "inf";
 
 CREATE TABLE "inf" (
-  "dur" varchar(45) DEFAULT NULL,
+  "dur" integer DEFAULT NULL,
   "a_id" integer  DEFAULT 0,
   PRIMARY KEY ("a_id")
 ) ;
@@ -67,4 +67,3 @@ CREATE TABLE "rel13" (
   "m_id" integer  DEFAULT 0,
   PRIMARY KEY ("a_id","m_id")
 ) ;
-
