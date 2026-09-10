@@ -1,4 +1,7 @@
 # How Good Are Learned Cost Models, Really? Insights from Query Optimization Tasks 
+
+> 本工作区的精简入口只公开 End-To-End、QueryFormer、Zero-Shot、DACE 和 QPP-Net；运行方法与 JOB-light 示例见 [FOCUSED_README.md](FOCUSED_README.md)。
+
 This repository contains the evaluation **source code** of the SIGMOD Paper: "[How Good Are Learned Cost Models, Really?
 Insights from Query Optimization Tasks](https://dl.acm.org/doi/10.1145/3725309)" from Roman Heinrich, Manisha Luthra,
 Johannes Wehrstein, Harald Kornmayer and Carsten Binnig. It provides a set of **Learned Cost Models (LCMs)** that are
