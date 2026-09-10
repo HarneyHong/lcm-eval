@@ -1,3 +1,4 @@
+import copy
 import functools
 from pathlib import Path
 from typing import List, Optional
@@ -12,6 +13,7 @@ from classes.classes import DataLoaderOptions, QPPNetModelConfig, ModelConfig
 from classes.workload_runs import WorkloadRuns
 from training.dataset.dataset_creation import read_workload_runs, derive_label_normalizer
 from training.dataset.plan_dataset import PlanDataset
+from training.dataset.aligned_splits import create_aligned_datasets
 
 
 def create_qppnet_dataloader(workload_runs: WorkloadRuns,
@@ -40,12 +42,25 @@ def create_qppnet_dataloader(workload_runs: WorkloadRuns,
                                                         "workload driven models")
         print("Create dataloader for training, validation and test data")
 
-        label_norm, train_dataset, val_dataset, database_statistics \
-            = create_datasets(workload_run_paths=workload_runs.train_workload_runs,
-                              model_config=model_config,
-                              val_ratio=data_loader_options.val_ratio)
-
-        test_dataset, val_dataset = val_dataset.split(0.5)
+        if workload_runs.split_manifest is not None:
+            if workload_runs.experiment_protocol not in {"qpp_native", "matched"}:
+                raise ValueError("QPP-Net requires qpp_native or matched protocol")
+            plans, database_statistics = read_workload_runs(
+                workload_run_paths=workload_runs.train_workload_runs,
+                execution_mode=model_config.execution_mode,
+            )
+            train_dataset, val_dataset, test_dataset, _ = create_aligned_datasets(
+                plans,
+                workload_runs.split_manifest,
+                workload_runs.alignment_manifest,
+                apply_qppnet_support=True,
+            )
+        else:
+            label_norm, train_dataset, val_dataset, database_statistics \
+                = create_datasets(workload_run_paths=workload_runs.train_workload_runs,
+                                  model_config=model_config,
+                                  val_ratio=data_loader_options.val_ratio)
+            test_dataset, val_dataset = val_dataset.split(0.5)
         print(f"Created datasets of size: "
               f"train {len(train_dataset)}, "
               f"validation: {len(val_dataset)}, t"
@@ -125,23 +140,18 @@ def create_datasets(workload_run_paths,
 
 def qppnet_collator(plans, feature_statistics: dict = None, db_statistics: dict = None, column_statistics: dict = None, plan_featurization=None):
     labels = []
-    labels = []
     query_plans = []
 
     # iterate over plans and create lists of edges and features per node
     sample_idxs = []
-    errors = []
     for sample_idx, p in plans:
-        query_plan: OperatorTree = operator_tree_from_json(vars(p))
-        #if query_plan.min_cardinality() != 0:
+        query_id = getattr(p, "query_id", sample_idx)
         try:
+            query_plan: OperatorTree = operator_tree_from_json(copy.deepcopy(vars(p)))
             query_plan.encode_recursively(column_statistics, feature_statistics, plan_featurization)
             sample_idxs.append(sample_idx)
             labels.append(query_plan.runtime)
             query_plans.append(query_plan)
-        except ValueError as e:
-            errors.append(e)
-
-    if errors:
-        print(errors)
+        except Exception as e:
+            raise ValueError(f"QPP-Net encoding failed for query_id={query_id}") from e
     return query_plans, labels, sample_idxs

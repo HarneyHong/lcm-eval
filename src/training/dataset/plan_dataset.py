@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 class PlanDataset(Dataset):
     def __init__(self, plans, idxs):
         self.plans = plans
-        self.idxs = [int(i) for i in idxs]
+        self.idxs = list(idxs)
         assert len(self.plans) == len(self.idxs)
 
     def __len__(self):

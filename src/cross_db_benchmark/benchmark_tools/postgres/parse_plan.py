@@ -268,6 +268,10 @@ def parse_plans(run_stats, min_runtime=100, max_runtime=30000, parse_baseline=Fa
 
         # add sql string do analyze plan
         analyze_plan.sql = q.sql
+        if hasattr(q, 'query_id'):
+            analyze_plan.query_id = q.query_id
+        if hasattr(q, 'workload_index'):
+            analyze_plan.workload_index = q.workload_index
 
         parsed_plans.append(analyze_plan)
 
@@ -319,6 +323,9 @@ def parse_plans(run_stats, min_runtime=100, max_runtime=30000, parse_baseline=Fa
 
     parsed_runs = dict(parsed_plans=parsed_plans, database_stats=database_stats,
                        run_kwargs=run_stats.run_kwargs)
+    for metadata_key in ('collection_mode', 'source_workload_sha256', 'paired_collection_settings'):
+        if hasattr(run_stats, metadata_key):
+            parsed_runs[metadata_key] = getattr(run_stats, metadata_key)
 
     stats = dict(
         runtimes=str(avg_runtimes),

@@ -246,7 +246,7 @@ def use_model(mode: str,
         epochs_wo_improvement = 0
 
     if mode in ["train", "retrain"]:
-        if isinstance(model_config, TabularModelConfig):
+        if isinstance(config, TabularModelConfig):
             train_tabular_model(workload_runs=wl_runs,
                                 config=config,
                                 statistics_file=statistics_file,
@@ -267,7 +267,7 @@ def use_model(mode: str,
         print(f'--Run {config.name.NAME} ended at {datetime.now().strftime("%d/%m/%Y %H:%M:%S")} --')
 
     if mode in ["train", "retrain", "predict"]:
-        if isinstance(model_config, TabularModelConfig):
+        if isinstance(config, TabularModelConfig):
             predict_tabular_model(config=config,
                                   workload_runs=wl_runs,
                                   statistics_file=statistics_file,
@@ -337,6 +337,11 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_name', default=None)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num_workers', type=int, default=20)
+    parser.add_argument('--split_manifest', default=None)
+    parser.add_argument('--alignment_manifest', default=None)
+    parser.add_argument('--experiment_protocol',
+                        choices=["legacy", "baseline_native", "qpp_native", "matched"],
+                        default="legacy")
     args = parser.parse_args()
 
     # Init model configuration by either reading out hyperparameters or using standard config
@@ -348,7 +353,13 @@ if __name__ == '__main__':
 
     # Create workload runs
     if args.mode in ["predict", "explain"]:
-        runs = WorkloadRuns([], [Path(raw_path) for raw_path in args.test_workload_runs])
+        runs = WorkloadRuns(
+            [],
+            [Path(raw_path) for raw_path in args.test_workload_runs],
+            split_manifest=Path(args.split_manifest) if args.split_manifest else None,
+            alignment_manifest=Path(args.alignment_manifest) if args.alignment_manifest else None,
+            experiment_protocol=args.experiment_protocol,
+        )
         model_args.update(batch_size=16)
 
     else:
@@ -357,7 +368,13 @@ if __name__ == '__main__':
             test_runs = [Path(raw_path) for raw_path in args.test_workload_runs]
         else:
             test_runs = []
-        runs = WorkloadRuns(train_workload_runs=train_runs, test_workload_runs=test_runs)
+        runs = WorkloadRuns(
+            train_workload_runs=train_runs,
+            test_workload_runs=test_runs,
+            split_manifest=Path(args.split_manifest) if args.split_manifest else None,
+            alignment_manifest=Path(args.alignment_manifest) if args.alignment_manifest else None,
+            experiment_protocol=args.experiment_protocol,
+        )
 
     model_config = get_model_config(model_type=args.model_type, m_args=model_args)
 

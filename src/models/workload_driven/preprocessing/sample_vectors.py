@@ -77,9 +77,9 @@ def augment_sample(table_samples, col_stats, p_node):
         augment_sample(table_samples, col_stats, c)
 
 
-def augment_sample_vectors(dataset, data_dir, plan_path, target_path, no_samples=1000):
+def augment_sample_vectors(dataset, data_dir, plan_path, target_path, no_samples=1000, force=False):
     print("Augment Sample Vectors")
-    if os.path.exists(target_path):
+    if os.path.exists(target_path) and not force:
         print(f'Skip for {target_path}')
         return
     os.makedirs(os.path.dirname(target_path), exist_ok=True)

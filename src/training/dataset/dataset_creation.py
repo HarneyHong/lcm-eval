@@ -51,7 +51,11 @@ def read_workload_runs(workload_run_paths: List[Path],
                 if plan.analyze_plans:
                     analyze_plans = plan.analyze_plans
                     # assert len(analyze_plans) == 1, "Multiple plans found"
-                    plans.append(analyze_plans[0])
+                    analyze_plan = analyze_plans[0]
+                    for metadata_key in ("query_id", "workload_index", "sql"):
+                        if hasattr(plan, metadata_key):
+                            setattr(analyze_plan, metadata_key, getattr(plan, metadata_key))
+                    plans.append(analyze_plan)
 
     #print(f"No of Plans: {len(plans)} for {workload_run_paths}")
     return plans, database_statistics

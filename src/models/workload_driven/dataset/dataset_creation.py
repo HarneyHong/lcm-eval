@@ -11,7 +11,8 @@ from classes.classes import ModelConfig, DataLoaderOptions, TPoolModelConfig, Tl
     TestSumModelConfig, MSCNModelConfig, QueryFormerModelConfig
 from classes.workload_runs import WorkloadRuns
 from cross_db_benchmark.benchmark_tools.utils import load_json
-from training.dataset.dataset_creation import create_datasets
+from training.dataset.aligned_splits import create_aligned_datasets
+from training.dataset.dataset_creation import create_datasets, read_workload_runs
 
 
 class InputDims:
@@ -193,12 +194,25 @@ def create_baseline_dataloader(workload_runs: WorkloadRuns,
                                                         "workload driven models")
         print("Create dataloader for training, validation and test data")
 
-        label_norm, train_dataset, val_dataset, database_statistics = \
-            create_datasets(workload_run_paths=workload_runs.train_workload_runs,
-                            model_config=model_config,
-                            val_ratio=data_loader_options.val_ratio)
-
-        test_dataset, val_dataset = val_dataset.split(0.5)
+        if workload_runs.split_manifest is not None:
+            if workload_runs.experiment_protocol not in {"baseline_native", "matched"}:
+                raise ValueError("Baseline models require baseline_native or matched protocol")
+            plans, database_statistics = read_workload_runs(
+                workload_run_paths=workload_runs.train_workload_runs,
+                execution_mode=model_config.execution_mode,
+            )
+            train_dataset, val_dataset, test_dataset, _ = create_aligned_datasets(
+                plans,
+                workload_runs.split_manifest,
+                workload_runs.alignment_manifest,
+                apply_qppnet_support=workload_runs.experiment_protocol == "matched",
+            )
+        else:
+            label_norm, train_dataset, val_dataset, database_statistics = \
+                create_datasets(workload_run_paths=workload_runs.train_workload_runs,
+                                model_config=model_config,
+                                val_ratio=data_loader_options.val_ratio)
+            test_dataset, val_dataset = val_dataset.split(0.5)
         print(
             f"Created datasets of size: train {len(train_dataset)}, validation: {len(val_dataset)}, test: {len(test_dataset)}")
         assert_db_stats_consistence(database_statistics, database_statistics, train_dataset)

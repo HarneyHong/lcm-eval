@@ -180,7 +180,7 @@ def to_rows(indexes, labels, predictions):
     """ Write down test-set predictions to file and to wandb"""
     rows = []
     for (index, label, prediction) in zip(indexes, labels, predictions):
-        entry = dict(query_index=index, label=label, prediction=prediction)
+        entry = dict(query_id=index, query_index=index, label=label, prediction=prediction)
         entry.update(qerror=QError().evaluate_metric(label, prediction))
         rows.append(entry)
     return rows

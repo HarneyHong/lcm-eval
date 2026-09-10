@@ -13,6 +13,9 @@ class WorkloadRuns:
     train_workload_runs: List[Path] = field(default=None)
     test_workload_runs: Optional[List[Path]] = field(default=None)
     target_test_csv_paths: List[Path] = []
+    split_manifest: Optional[Path] = None
+    alignment_manifest: Optional[Path] = None
+    experiment_protocol: str = "legacy"
 
     def update_test_workloads(self, target_dir: Path, seed: int) -> None:
         if self.test_workload_runs:

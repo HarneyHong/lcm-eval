@@ -55,6 +55,8 @@ if __name__ == '__main__':
     parser.add_argument('--query_timeout', default=30, type=int)
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--target', default=None)
+    parser.add_argument('--raw_target', default=None)
+    parser.add_argument('--json_target', default=None)
     parser.add_argument('--workload_slice_stats', default=None)
     parser.add_argument('--source', default=None)
     parser.add_argument('--hints', default=None)
@@ -80,7 +82,7 @@ if __name__ == '__main__':
     parser.add_argument('--generate_workload', action='store_true')
     parser.add_argument('--check_join_conditions', action='store_true')
     parser.add_argument('--run_workload', action='store_true')
-    parser.add_argument('--mode', choices=["json", "raw"], default="json"),
+    parser.add_argument('--mode', choices=["json", "raw", "paired"], default="json"),
     parser.add_argument('--run_explain_only', action='store_true')
     parser.add_argument('--parse_explain_only', action='store_true')
     parser.add_argument('--parse_run', action='store_true')
@@ -146,7 +148,8 @@ if __name__ == '__main__':
         run_workload(args.source, args.database, args.db_name, args.database_conn_dict, args.database_kwarg_dict,
                      args.target, args.run_kwargs_dict, args.repetitions_per_query, args.query_timeout, mode=args.mode,
                      with_indexes=args.with_indexes, cap_workload=args.cap_workload, min_runtime=args.min_query_ms,
-                     hints=args.hints, explain_only=args.run_explain_only)
+                     max_runtime=args.max_query_ms, raw_target_path=args.raw_target,
+                     json_target_path=args.json_target, hints=args.hints, explain_only=args.run_explain_only)
 
     if args.parse_run:
         parse_run(args.source, args.target, args.database, min_query_ms=args.min_query_ms,

@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+from classes.classes import ZeroShotModelConfig
 from models.zeroshot.specific_models.postgres_zero_shot import PostgresZeroShotModel
 
 
@@ -13,9 +14,16 @@ def message_passing(g, model_class=PostgresZeroShotModel):
     tree_layer_kwargs = dict(width_factor=1, n_layers=2, test=True)
     final_mlp_kwargs.update(**fc_out_kwargs)
     tree_layer_kwargs.update(**fc_out_kwargs)
-    m = model_class(device='cpu', hidden_dim=6, final_mlp_kwargs=final_mlp_kwargs,
-                    tree_layer_name='MscnConv',
-                    tree_layer_kwargs=tree_layer_kwargs, test=True)
+    config = ZeroShotModelConfig(
+        device='cpu',
+        hidden_dim=6,
+        final_mlp_kwargs=final_mlp_kwargs,
+        tree_layer_name='MscnConv',
+        tree_layer_kwargs=tree_layer_kwargs,
+        featurization=None,
+    )
+    m = model_class(model_config=config, feature_statistics={})
+    m.test = True
     # initialize hidden states with one hot encodings
     no_nodes_per_type = []
     hidden_dict = dict()
