@@ -1,100 +1,70 @@
-# 新数据 CPU 训练指南（完整保留版）
+# 当前数据收集后的完整训练指南
 
-> 阅读路线：第一部分完整保留原来的环境、预处理、单库训练、结果检查、Zero-Shot/DACE 19/1 跨库训练和复现注意事项。第一部分第 4～7 节是旧的“raw/JSON 独立采集”单库流程，仅用于理解旧数据；重新采集的 IMDB/TPC-H-PK 不再执行这些旧命令，应执行第二部分。第一部分第 9 节的跨库流程仍然需要，但 IMDB/TPC-H-PK 的 raw 路径和 standard parse 命令要按第二部分第 8 节替换。
+本指南只描述当前要执行的流程，不再保留旧的 raw/JSON 独立采集训练命令。当前状态是：
 
-> 当前实验假设其余 18 个数据库的旧 raw 已收集完成；第一部分保留的“6 个库未完成”是当时的状态记录，不再作为当前执行判断。正式运行前仍应以文件检查结果为准。
+- 20 个数据库的旧 raw 已经收集完成；
+- 其余 18 库继续使用现有 raw；
+- JOB 在仓库中的数据库名是 `imdb`；
+- `imdb` 和 `tpc_h_pk` 旧 raw/JSON 的 SQL 集合没有对齐，因此这两个库需要按 paired 模式重新收集；
+- E2E、QueryFormer、QPP-Net 在 `imdb` 和 `tpc_h_pk` 上做单库训练；
+- Zero-Shot、DACE 使用 20 库 standard parsed，按 19 库训练、1 库测试。
 
-| 任务 | 应执行的章节 |
-| --- | --- |
-| 安装与检查 CPU 环境 | 第一部分第 2～3 节 |
-| 用旧独立 raw/JSON 重跑旧单库实验 | 第一部分第 4～7 节 |
-| 用新 paired IMDB/TPC-H-PK 进行当前单库实验 | 第二部分第 1～7 节 |
-| 检查 checkpoint、CSV 和复现脚本注意事项 | 第一部分第 8、10、11 节 |
-| Zero-Shot/DACE 19/1 跨库训练 | 第二部分第 8.1～8.2 节，然后第一部分第 9.3～9.7 节 |
+| 负责人 | 模型 | 当前训练输入 | 协议 |
+| --- | --- | --- | --- |
+| 房子珈 | E2E | paired raw 派生的 augmented baseline master | 单库固定 80/10/10 |
+| 李昊森 | QueryFormer | 与 E2E 相同的 baseline master | 单库固定 80/10/10 |
+| 何沅东 | QPP-Net | paired JSON 派生的 JSON master | 单库固定 split 内的 QPP-supported 子集 |
+| 赵嘉祺 | Zero-Shot / DACE | 20 库 raw 派生的 standard parsed | 其余 19 库训练、目标库测试 |
 
-# 第一部分：原有完整训练流程（legacy/reference）
+## 1. 其余 18 库是否需要重新收集
 
-本指南只解决一件事：使用 CPU 训练机上已经收集好的计划数据，先训练 E2E、QueryFormer 和 QPP-Net；20 个数据库收齐后，再训练 Zero-Shot 和 DACE，并查看测试结果。
+不需要因为 IMDB/TPC-H-PK 的 raw/JSON 错位而重新收集其余 18 库。那 18 个库不参加本次 QPP-Net 的 paired JSON 对齐，它们已有的 raw 格式可以继续用于 Zero-Shot/DACE。
 
-本指南默认仓库位于 `/root/lcm-eval`。如果实际路径不同，只需修改下面的 `LCM_ROOT`。
-
-## 1. 当前分工和输入
-
-
-| 负责人 | 模型               | 需要的采集数据                   | 训练输入                            | 测试方式            |
-| --- | ---------------- | ------------------------- | ------------------------------- | --------------- |
-| 房子珈 | E2E              | raw 文本计划                  | baseline parsed + sample bitmap | 单库内部 80/10/10   |
-| 李昊森 | QueryFormer      | raw 文本计划                  | baseline parsed + sample bitmap | 单库内部 80/10/10   |
-| 何沅东 | QPP-Net          | `--mode json` 采集的 JSON 计划 | 清洗后的 JSON `query_list`          | 单库内部 80/10/10   |
-| 暂停  | Zero-Shot / DACE | 20 个数据库的 raw 计划           | standard parsed                 | 其余 19 库训练，目标库测试 |
-
-
-赵嘉祺负责的以下 6 个数据库还没有收集完：
+但是需要区分两层过滤：
 
 ```text
-credit employee fhnk financial geneea genome
+raw collector 的有效性：执行成功、未超时、raw runtime >= 100ms、非零基数
+standard parser 的有效性：在上述基础上还可能跳过 InitPlan/SubPlan、空 Result 或解析失败
 ```
 
-因此，现在不进行 Zero-Shot 和 DACE 的正式复现。不要把少于 20 库的实验当成论文的 19 库训练/1 库测试结果。
+所以，旧 raw 收集到 5,000 条有效查询，不保证 standard parse 后仍有 5,000 条。正确处理方式是：
 
-本次实验已确定只在下面两个目标库上训练和测试 workload-driven 模型：
+1. 不整库重采；
+2. 先按第 7.2 节对 20 库生成 standard parsed 并计数；
+3. 只有某库少于目标数量时，才按第 7.3 节在原 raw target 上提高 cap、断点增量补采；
+4. 补采后重新 parse，直到其余库各 5,000 条，IMDB/TPC-H-PK 各 10,000 条。
+
+## 2. 新旧数据格式与五个模型的关系
+
+新的 paired raw 没有改变 PostgreSQL raw 计划的核心格式，只在原来的每条 `query_list` 记录上增加了：
 
 ```text
-imdb tpc_h_pk
+query_id
+workload_index
+execution_order
+pair_valid / pair_invalid_reasons
+raw_runtime_ms / json_runtime_ms
+raw/json plan fingerprint
 ```
 
-所以 E2E、QueryFormer 和 QPP-Net 都只需要在 `imdb` 和 `tpc_h_pk` 上分别训练。
+因此 IMDB/TPC-H-PK 的新 paired raw 可以和其余 18 库旧 raw 一样交给 standard parser。Zero-Shot/DACE 不使用的附加字段会被忽略。
 
-## 2. 训练机需要哪些文件
+| 模型 | 原始来源 | 真正训练输入 | 标签 |
+| --- | --- | --- | --- |
+| E2E | IMDB/TPC-H-PK paired raw | `augmented_baseline_master` | raw runtime |
+| QueryFormer | IMDB/TPC-H-PK paired raw | 与 E2E 相同 | raw runtime |
+| QPP-Net | IMDB/TPC-H-PK paired JSON | `json_master` 中 QPP-supported 查询 | JSON runtime |
+| Zero-Shot | 20 库 raw | `parsed_complex` standard parsed | raw runtime |
+| DACE | 20 库 raw | 与 Zero-Shot 相同 | raw runtime |
 
-E2E 和 QueryFormer 需要：
+不要把下面几种文件混用：
 
 ```text
-/root/lcm-eval/data/raw_complex/imdb/complex_workload_200k_s1.json
-/root/lcm-eval/data/raw_complex/tpc_h_pk/complex_workload_200k_s1.json
-
-/root/lcm-eval/data/datasets/imdb/*.csv
-/root/lcm-eval/data/datasets/tpc_h/*.csv
+baseline master：只给 E2E / QueryFormer
+JSON master：只给 QPP-Net
+standard parsed：给 Zero-Shot / DACE
+alignment manifest / split：当前只控制三个单库模型
 ```
-
-QPP-Net 需要：
-
-```text
-/root/lcm-eval/data/json_complex/imdb/complex_workload_200k_s1/complex_workload_200k_s1.json
-/root/lcm-eval/data/json_complex/tpc_h_pk/complex_workload_200k_s1/complex_workload_200k_s1.json
-```
-
-开始预处理前，只需要检查上述路径中的数据是否已经存在：
-
-```bash
-for db in imdb tpc_h_pk; do
-  raw="/root/lcm-eval/data/raw_complex/$db/complex_workload_200k_s1.json"
-  json="/root/lcm-eval/data/json_complex/$db/complex_workload_200k_s1/complex_workload_200k_s1.json"
-  if [[ "$db" == tpc_h_pk ]]; then
-    csv_dir="/root/lcm-eval/data/datasets/tpc_h"
-  else
-    csv_dir="/root/lcm-eval/data/datasets/$db"
-  fi
-
-  [[ -s "$raw" ]] \
-    && echo "OK      $raw" \
-    || echo "MISSING $raw"
-
-  [[ -s "$json" ]] \
-    && echo "OK      $json" \
-    || echo "MISSING $json"
-
-  if [[ -d "$csv_dir" ]] && find "$csv_dir" -maxdepth 1 -type f -name '*.csv' -print -quit | grep -q .; then
-    echo "OK      $csv_dir/*.csv"
-  else
-    echo "MISSING $csv_dir/*.csv"
-  fi
-done
-```
-
-作用：只读检查 IMDB 和 TPC-H-PK 的 raw、JSON mode 计划以及 CSV 数据是否存在，不会复制或修改任何数据。全部显示 `OK` 后再继续；出现 `MISSING` 时，请先让对应数据负责人补齐该路径。
-
-训练机不需要运行 PostgreSQL，也不需要重新执行 SQL。
 
 ## 3. 一次性 CPU 环境
 
@@ -103,21 +73,21 @@ done
 如果训练机已经有可用的 `.venv`，先执行：
 
 ```bash
-cd /root/lcm-eval/src
-/root/lcm-eval/.venv/bin/python -c 'import torch, dgl, gensim; print("environment OK")'
+cd /data/workspace/lcm-eval/src
+/data/workspace/lcm-eval/.venv/bin/python -c 'import torch, dgl, gensim; print("environment OK")'
 ```
 
 作用：检查 PyTorch、DGL 和 word2vec 依赖能否导入。如果打印 `environment OK`，可以跳过下一节。项目的 `main.py` 在第 3.3 节设置好 `NODE00...NODE05` 后再检查。
 
 ### 3.2 没有环境时
 
- 参考 [https://github.com/fzj2007/LCM-Reproduction-Script](https://github.com/fzj2007/LCM-Reproduction-Script) 已验证过 CPU 版 PyTorch 2.3.0 + DGL 1.1.3。在 `/root/lcm-eval` 中建立独立环境：
+ 参考 [https://github.com/fzj2007/LCM-Reproduction-Script](https://github.com/fzj2007/LCM-Reproduction-Script) 已验证过 CPU 版 PyTorch 2.3.0 + DGL 1.1.3。在 `/data/workspace/lcm-eval` 中建立独立环境：
 
 ```bash
-cd /root/lcm-eval
+cd /data/workspace/lcm-eval
 python3 -m venv .venv-cpu
 
-export PY=/root/lcm-eval/.venv-cpu/bin/python
+export PY=/data/workspace/lcm-eval/.venv-cpu/bin/python
 
 "$PY" -m pip install --upgrade pip setuptools wheel
 "$PY" -m pip install torch==2.3.0 torchvision==0.18.0 \
@@ -137,7 +107,7 @@ export PY=/root/lcm-eval/.venv-cpu/bin/python
 ### 3.3 每次登录后设置变量
 
 ```bash
-export LCM_ROOT=/root/lcm-eval
+export LCM_ROOT=/data/workspace/lcm-eval
 export SRC="$LCM_ROOT/src"
 
 # 仓库中已经有 .venv 时使用这一行：
@@ -148,11 +118,8 @@ export PY="$LCM_ROOT/.venv/bin/python"
 
 export RAW_ROOT="$LCM_ROOT/data/raw_complex"
 export JSON_ROOT="$LCM_ROOT/data/json_complex"
-export BASELINE_ROOT="$LCM_ROOT/data/parsed_complex_baseline"
-export AUG_ROOT="$LCM_ROOT/data/augmented_complex_baseline"
 export STANDARD_ROOT="$LCM_ROOT/data/parsed_complex"
 export SENT_ROOT="$LCM_ROOT/data/sentences"
-export CLEAN_JSON_ROOT="$LCM_ROOT/data/json_complex_clean"
 export STATS_ROOT="$LCM_ROOT/data/feature_statistics"
 export MODEL_ROOT="$LCM_ROOT/data/models"
 export EVAL_ROOT="$LCM_ROOT/data/evaluation"
@@ -170,8 +137,7 @@ NODE_ENV='{"hostname":"localhost","python":"3.10"}'
 export NODE00="$NODE_ENV" NODE01="$NODE_ENV" NODE02="$NODE_ENV"
 export NODE03="$NODE_ENV" NODE04="$NODE_ENV" NODE05="$NODE_ENV"
 
-mkdir -p "$BASELINE_ROOT" "$AUG_ROOT" "$SENT_ROOT"
-mkdir -p "$CLEAN_JSON_ROOT" "$STATS_ROOT" "$MODEL_ROOT" "$EVAL_ROOT"
+mkdir -p "$STANDARD_ROOT" "$SENT_ROOT" "$STATS_ROOT" "$MODEL_ROOT" "$EVAL_ROOT"
 
 cd "$SRC"
 "$PY" -c 'import main; print("main.py OK")'
@@ -179,107 +145,138 @@ cd "$SRC"
 
 最后打印 `main.py OK` 即表示环境可以用。
 
-## 4. E2E 和 QueryFormer 的共享预处理
 
-E2E 和 QueryFormer 使用相同的 augmented 训练数据。这一节每个数据库只需执行一次；建议由房子珈生成，李昊森直接复用。
+## 4. 当前输入检查
 
-先选择数据库。每次只执行下面一组：
-
-```bash
-# IMDB
-export TARGET_DB=imdb
-export CSV_DB=imdb
-export CAP=10000
-
-# TPC-H-PK（跑 TPC-H-PK 时改用这三行）
-# export TARGET_DB=tpc_h_pk
-# export CSV_DB=tpc_h
-# export CAP=10000
-```
-
-`TARGET_DB` 是计划和仓库元数据使用的数据库名；`CSV_DB` 是实际 CSV 目录名。TPC-H-PK 的计划目录叫 `tpc_h_pk`，但它复用 `data/datasets/tpc_h` 下的 CSV。
-
-选好后，依次执行下面 5 步。
-
-### 4.1 raw → baseline parsed
+先执行第 3.3 节的公共环境变量，再定义 20 库及其 raw 路径规则：
 
 ```bash
-export RAW_RUN="$RAW_ROOT/$TARGET_DB/complex_workload_200k_s1.json"
-export BASELINE_RUN="$BASELINE_ROOT/$TARGET_DB/complex_workload_200k_s1.json"
-
-mkdir -p "$(dirname "$BASELINE_RUN")"
-
-cd "$SRC"
-"$PY" run_benchmark.py \
-  --parse_run \
-  --source "$RAW_RUN" \
-  --target "$BASELINE_RUN" \
-  --parse_baseline \
-  --min_query_ms 100 \
-  --max_query_ms 30000 \
-  --cap_queries "$CAP"
-```
-
-作用：读取 raw `query_list`，去掉无效计划以及运行时间不在 100ms～30000ms 的计划，生成 baseline parsed。
-
-`--cap_queries 10000` 表示 baseline parsed 最多输出 10000 条。目前实测 JOB（IMDB）虽然采集到了 10000 条有效 raw 查询，但转换时会跳过其中 13 条包含 `InitPlan` 的查询，因此当前只得到 9987 条 baseline parsed。为了保证 JOB 的最终训练输入为 10000 条，需要继续补充采集新的有效查询，然后重新转换，并以 baseline parsed 实际达到 10000 条为准。TPC-H-PK 实测不需要补采，现有 10000 条 raw 已全部成功转换为 10000 条 baseline parsed。
-
-转换中出现的 `did not find enough filters` 警告不会删除整条计划，但表示该计划中的个别复杂 `OR/IN` 过滤条件没有被解析器完整展开。
-
-转换后检查实际条数：
-
-```bash
-"$PY" - "$BASELINE_RUN" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1]) as file:
-    count = len(json.load(file).get("parsed_plans", []))
-print("baseline parsed:", count)
-if count < 10000:
-    raise SystemExit("不足 10000 条：请补采 raw 查询后重新转换")
-PY
-```
-
-只有打印 `baseline parsed: 10000` 后，才继续生成 sample bitmap。JOB 当前的 9987 条只用于跑通流程，正式训练前仍需补齐。
-
-产物：`data/parsed_complex_baseline/<db>/complex_workload_200k_s1.json`。
-
-### 4.2 增加 sample bitmap
-
-```bash
-export AUG_RUN="$AUG_ROOT/$TARGET_DB/complex_workload_200k_s1.json"
-export CSV_DIR="$LCM_ROOT/data/datasets/$CSV_DB"
-
-cd "$SRC"
-"$PY" - "$TARGET_DB" "$CSV_DIR" \
-  "$BASELINE_RUN" "$AUG_RUN" <<'PY'
-import sys
-from models.workload_driven.preprocessing.sample_vectors import augment_sample_vectors
-
-augment_sample_vectors(
-    dataset=sys.argv[1],
-    data_dir=sys.argv[2],
-    plan_path=sys.argv[3],
-    target_path=sys.argv[4],
+ALL_DBS=(
+  accidents airline baseball basketball carcinogenesis consumer
+  credit employee fhnk financial geneea genome hepatitis imdb
+  movielens seznam ssb tournament tpc_h_pk walmart
 )
+
+raw_source() {
+  local db="$1"
+  if [[ "$db" == imdb || "$db" == tpc_h_pk ]]; then
+    printf '%s\n' "$RAW_ROOT/$db/complex_workload_200k_s1_paired.json"
+  else
+    printf '%s\n' "$RAW_ROOT/$db/complex_workload_200k_s1.json"
+  fi
+}
+
+missing=0
+for db in "${ALL_DBS[@]}"; do
+  source=$(raw_source "$db")
+  if [[ -s "$source" ]]; then
+    echo "OK      $db  $source"
+  else
+    echo "MISSING $db  $source"
+    missing=1
+  fi
+done
+[[ "$missing" -eq 0 ]] || { echo 'raw 文件未收齐，停止'; false; }
+```
+
+完成 `COLLECTION_GUIDE.md` 中的重新收集和 master preparation 后，IMDB/TPC-H-PK 还必须检查 paired JSON 和对齐产物：
+
+```bash
+missing=0
+for db in imdb tpc_h_pk; do
+  json="$JSON_ROOT/$db/complex_workload_200k_s1_paired/complex_workload_200k_s1_paired.json"
+  baseline="$LCM_ROOT/data/augmented_baseline_master/$db/complex_workload_200k_s1.json"
+  json_master="$LCM_ROOT/data/json_master/$db/complex_workload_200k_s1.json"
+  alignment="$LCM_ROOT/data/alignment/$db/complex_workload_200k_s1/manifest.json"
+  for file in "$json" "$baseline" "$json_master" "$alignment"; do
+    [[ -s "$file" ]] && echo "OK      $file" || { echo "MISSING $file"; missing=1; }
+  done
+done
+[[ "$missing" -eq 0 ]] || { echo 'paired 派生产物不完整，停止'; false; }
+```
+
+训练机只需要上述文件、两个目标库的 CSV 以及代码环境，不需要连接 PostgreSQL。只有收集机增量补采时才需要 PostgreSQL。
+
+## 5. 准备 IMDB/TPC-H-PK 对齐 master
+
+先按 `COLLECTION_GUIDE.md` 第二部分对 IMDB 和 TPC-H-PK 完成 paired 收集、baseline parse、sample bitmap 和 master preparation。最终必须满足：
+
+```text
+baseline master = 10,000 条
+baseline master query_id 顺序 = JSON master query_id 顺序
+seed 0/1/2 的 master split = 8,000 / 1,000 / 1,000
+QPP-Net 支持状态只作为 split 内 mask，不决定 baseline master
+```
+
+选择一个目标库和 seed：
+
+```bash
+export DB=imdb       # 第二个目标库改为 tpc_h_pk
+export SEED=0        # 完成后依次改为 1、2
+
+export BASELINE_MASTER="$LCM_ROOT/data/augmented_baseline_master/$DB/complex_workload_200k_s1.json"
+export JSON_MASTER="$LCM_ROOT/data/json_master/$DB/complex_workload_200k_s1.json"
+export ALIGN_DIR="$LCM_ROOT/data/alignment/$DB/complex_workload_200k_s1"
+export ALIGNMENT="$ALIGN_DIR/manifest.json"
+export SPLIT="$ALIGN_DIR/splits/seed_$SEED.json"
+export COLUMN_STATS="$SRC/cross_db_benchmark/datasets/$DB/column_statistics.json"
+export SENTENCES="$LCM_ROOT/data/sentences/aligned/$DB/sentences.json"
+export WORD2VEC="$LCM_ROOT/data/sentences/aligned/$DB/word2vec.m"
+export BASELINE_STATS="$LCM_ROOT/data/feature_statistics/aligned_baseline/$DB/feature_statistics.json"
+export QPP_STATS="$LCM_ROOT/data/feature_statistics/aligned_qpp/$DB/feature_statistics.json"
+```
+
+检查 query ID 和数量：
+
+```bash
+"$PY" - "$BASELINE_MASTER" "$JSON_MASTER" "$ALIGNMENT" "$SPLIT" <<'PY'
+import json, sys
+baseline_path, json_path, alignment_path, split_path = sys.argv[1:]
+with open(baseline_path) as f:
+    baseline_ids = [p["query_id"] for p in json.load(f)["parsed_plans"]]
+with open(json_path) as f:
+    json_ids = [q["query_id"] for q in json.load(f)["query_list"]]
+with open(alignment_path) as f:
+    alignment = json.load(f)
+with open(split_path) as f:
+    split = json.load(f)
+split_ids = split["train"] + split["validation"] + split["test"]
+assert alignment["ready"] is True
+assert len(baseline_ids) == 10000
+assert baseline_ids == json_ids == alignment["master_query_ids"]
+assert len(split["train"]) == 8000
+assert len(split["validation"]) == 1000
+assert len(split["test"]) == 1000
+assert set(split_ids) == set(baseline_ids) and len(split_ids) == len(set(split_ids))
+print(json.dumps(alignment["summary"], indent=2))
 PY
 ```
 
-作用：读取 `data/datasets/<db>/*.csv`，为计划中的谓词生成 sample bitmap。
+## 6. E2E、QueryFormer、QPP-Net 单库训练
 
-产物：`data/augmented_complex_baseline/<db>/complex_workload_200k_s1.json`。
+这里有两种结果口径：
 
-如果目标文件已存在，该函数会直接跳过。如果 raw 重新收集过，请不要沿用旧 augmented 文件。
+```text
+native：E2E/QueryFormer 使用完整 master split；QPP-Net 使用各 split 内自身支持的查询
+matched：三个模型都使用各 master split 与 QPP support mask 的交集，并分别重新训练
+```
 
-### 4.3 生成 sentences
+不存在公共 runtime 标签。E2E/QueryFormer 使用 raw runtime，QPP-Net 使用 JSON runtime；公平性来自相同 SQL、相同物理计划和相同 query ID split。
+
+
+### 6.1 生成公共预处理资源
+
+#### 6.1.1 sentences 和 word2vec
+
+TPC-H-PK 的 CSV 目录是 `tpc_h`：
 
 ```bash
-export SENTENCES="$SENT_ROOT/$TARGET_DB/sentences.json"
+export CSV_DB="$DB"
+[[ "$DB" == "tpc_h_pk" ]] && export CSV_DB=tpc_h
 
+mkdir -p "$(dirname "$SENTENCES")"
 cd "$SRC"
-"$PY" - "$TARGET_DB" "$BASELINE_RUN" \
-  "$CSV_DIR" "$SENTENCES" <<'PY'
+"$PY" - "$DB" "$BASELINE_MASTER" "$LCM_ROOT/data/datasets/$CSV_DB" "$SENTENCES" <<'PY'
 import sys
 from models.workload_driven.preprocessing.sentence_creation import create_sentences
 
@@ -290,354 +287,241 @@ create_sentences(
     target=sys.argv[4],
 )
 PY
-```
 
-作用：从数据库 CSV 和查询谓词中提取用于训练 word2vec 的句子。
-
-产物：`data/sentences/<db>/sentences.json`。
-
-### 4.4 生成 word2vec
-
-```bash
-export WORD2VEC="$SENT_ROOT/$TARGET_DB/word2vec.m"
-
-cd "$SRC"
 "$PY" - "$SENTENCES" "$WORD2VEC" <<'PY'
 import sys
 from models.workload_driven.preprocessing.word_embeddings import compute_word_embeddings
-
 compute_word_embeddings(sys.argv[1], sys.argv[2])
 PY
 ```
 
-作用：用 sentences 训练字符串词向量。E2E 和 QueryFormer 训练都会读取该文件。
-
-产物：`data/sentences/<db>/word2vec.m`。
-
-同时生成的 `word2vec.m.vectors.npy` 也是词向量文件的一部分，请保留。
-
-该函数默认使用 `CPU 核数 - 2` 个 worker，因此机器至少需要 3 个逻辑 CPU。
-
-### 4.5 生成 feature statistics
+#### 6.1.2 feature statistics
 
 ```bash
-export AUG_STATS="$STATS_ROOT/augmented/$TARGET_DB/feature_statistics.json"
-
 cd "$SRC"
-"$PY" - "$AUG_RUN" "$AUG_STATS" <<'PY'
+"$PY" - "$BASELINE_MASTER" "$BASELINE_STATS" "$JSON_MASTER" "$QPP_STATS" <<'PY'
 import sys
 from training.preprocessing.feature_statistics import gather_feature_statistics
 
-gather_feature_statistics([sys.argv[1]], sys.argv[2])
-print("saved", sys.argv[2])
+baseline, baseline_stats, json_master, qpp_stats = sys.argv[1:]
+gather_feature_statistics([baseline], baseline_stats)
+gather_feature_statistics([json_master], qpp_stats)
 PY
 ```
 
-作用：统计目标库的数值范围和类别字典，供模型进行特征缩放和编码。
-
-产物：`data/feature_statistics/augmented/<db>/feature_statistics.json`。
-
-当前操作很简单：
-
-- 训练 IMDB 模型时，使用 IMDB 生成的 `feature_statistics.json`。
-- 训练 TPC-H-PK 模型时，使用 TPC-H-PK 生成的 `feature_statistics.json`。
-- 因此，其他 6 个还没收集完的数据库不会影响当前 E2E 和 QueryFormer 训练。
-
-`feature_statistics.json` 只是对训练数据中的数值范围和类别进行统计，不是另外一份查询训练数据。
-
-## 5. 房子珈：训练 E2E
-
-先确保第 4 节已经为当前 `TARGET_DB` 生成 `AUG_RUN`、`AUG_STATS` 和 `WORD2VEC`。
-
-以 IMDB、seed 0 为例：
+### 6.2 查看 QPP-Net coverage
 
 ```bash
-export TARGET_DB=imdb
-export SEED=0
+cd "$SRC"
+"$PY" evaluation/aligned_metrics.py \
+  --alignment_manifest "$ALIGNMENT" \
+  --split_manifest "$SPLIT"
+```
 
-export AUG_RUN="$AUG_ROOT/$TARGET_DB/complex_workload_200k_s1.json"
-export AUG_STATS="$STATS_ROOT/augmented/$TARGET_DB/feature_statistics.json"
-export WORD2VEC="$SENT_ROOT/$TARGET_DB/word2vec.m"
-export COLUMN_STATS="$SRC/cross_db_benchmark/datasets/$TARGET_DB/column_statistics.json"
+它会分别输出 train、validation、test 中 QPP-Net 支持的数量和比例。
 
-mkdir -p "$MODEL_ROOT/e2e/$TARGET_DB" "$EVAL_ROOT/e2e/$TARGET_DB"
+### 6.3 Native 训练
+
+#### 6.3.1 E2E
+
+```bash
+export MODEL_DIR="$LCM_ROOT/data/models/baseline_native/e2e/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/baseline_native/e2e/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
 
 cd "$SRC"
 set -o pipefail
-"$PY" main.py \
-  --mode train \
-  --model_type e2e \
-  --device cpu \
-  --model_dir "$MODEL_ROOT/e2e/$TARGET_DB" \
-  --target_dir "$EVAL_ROOT/e2e/$TARGET_DB" \
-  --statistics_file "$AUG_STATS" \
+"$PY" main.py --mode train --model_type e2e --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
+  --statistics_file "$BASELINE_STATS" \
   --column_statistics "$COLUMN_STATS" \
   --word_embeddings "$WORD2VEC" \
-  --workload_runs "$AUG_RUN" \
-  --num_workers 0 \
-  --seed "$SEED" \
-  2>&1 | tee "$EVAL_ROOT/e2e/$TARGET_DB/train_seed_${SEED}.log"
+  --workload_runs "$BASELINE_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol baseline_native \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
 ```
 
-作用：使用这一个数据库的 augmented workload 训练 E2E。程序自动按 80% train、10% validation、10% test 切分，训练结束后自动测试，所以这条命令不需要 `--test_workload_runs`。
-
-主要产物：
-
-```text
-data/models/e2e/<db>/e2e_0.pt
-data/evaluation/e2e/<db>/complex_workload_200k_s1_0_test_pred.csv
-data/evaluation/e2e/<db>/complex_workload_200k_s1_0_test_stats.csv
-```
-
-IMDB 跑通后，把 `TARGET_DB` 改为 `tpc_h_pk` 再跑一次。两库的 seed 0 都成功后，再依次使用 seed 1、2。
-
-## 6. 李昊森：训练 QueryFormer
-
-QueryFormer 直接复用第 4 节产生的数据。以 IMDB、seed 0 为例：
+#### 6.3.2 QueryFormer
 
 ```bash
-export TARGET_DB=imdb
-export SEED=0
-
-export AUG_RUN="$AUG_ROOT/$TARGET_DB/complex_workload_200k_s1.json"
-export AUG_STATS="$STATS_ROOT/augmented/$TARGET_DB/feature_statistics.json"
-export WORD2VEC="$SENT_ROOT/$TARGET_DB/word2vec.m"
-export COLUMN_STATS="$SRC/cross_db_benchmark/datasets/$TARGET_DB/column_statistics.json"
-
-mkdir -p "$MODEL_ROOT/query_former/$TARGET_DB" "$EVAL_ROOT/query_former/$TARGET_DB"
+export MODEL_DIR="$LCM_ROOT/data/models/baseline_native/query_former/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/baseline_native/query_former/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
 
 cd "$SRC"
 set -o pipefail
-"$PY" main.py \
-  --mode train \
-  --model_type query_former \
-  --device cpu \
-  --model_dir "$MODEL_ROOT/query_former/$TARGET_DB" \
-  --target_dir "$EVAL_ROOT/query_former/$TARGET_DB" \
-  --statistics_file "$AUG_STATS" \
+"$PY" main.py --mode train --model_type query_former --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
+  --statistics_file "$BASELINE_STATS" \
   --column_statistics "$COLUMN_STATS" \
   --word_embeddings "$WORD2VEC" \
-  --workload_runs "$AUG_RUN" \
-  --num_workers 0 \
-  --seed "$SEED" \
-  2>&1 | tee "$EVAL_ROOT/query_former/$TARGET_DB/train_seed_${SEED}.log"
+  --workload_runs "$BASELINE_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol baseline_native \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
 ```
 
-作用：使用目标库 augmented workload 训练 QueryFormer。它也会自动按 80/10/10 切分并在训练结束后测试。
-
-主要产物：
-
-```text
-data/models/query_former/<db>/query_former_0.pt
-data/evaluation/query_former/<db>/complex_workload_200k_s1_0_test_pred.csv
-data/evaluation/query_former/<db>/complex_workload_200k_s1_0_test_stats.csv
-```
-
-同样在 `imdb`、`tpc_h_pk` 上分别训练，先 seed 0，再 seed 1、2。
-
-## 7. 何沅东：准备并训练 QPP-Net
-
-QPP-Net 不使用第 4 节的 baseline parsed、sample bitmap 和 word2vec。它直接使用 PostgreSQL JSON mode 计划。
-
-先选择目标库，以 IMDB 为例：
+#### 6.3.3 QPP-Net
 
 ```bash
-export QPP_DB=imdb
-export QPP_SOURCE="$JSON_ROOT/$QPP_DB/complex_workload_200k_s1/complex_workload_200k_s1.json"
-export QPP_CLEAN="$CLEAN_JSON_ROOT/$QPP_DB/complex_workload_200k_s1.json"
-```
-
-### 7.1 清洗 JSON 训练数据
-
-```bash
-cd "$SRC"
-"$PY" - "$QPP_SOURCE" "$QPP_CLEAN" <<'PY'
-import copy
-import json
-import os
-import sys
-from collections import Counter
-
-from cross_db_benchmark.benchmark_tools.database import ExecutionMode
-from cross_db_benchmark.benchmark_tools.postgres.check_valid import check_valid
-from training.featurizations import QPPNetFeaturization
-
-source, target = sys.argv[1:3]
-with open(source) as file:
-    run = json.load(file)
-
-supported = set(QPPNetFeaturization.QPP_NET_OPERATOR_TYPES)
-join_types = {"Hash Join", "Merge Join", "Nested Loop"}
-
-def unsupported_nodes(node):
-    node_type = node.get("Node Type")
-    normalized = "Join" if node_type in join_types else node_type
-    result = [] if normalized in supported else [str(node_type)]
-    for child in node.get("Plans", []) or []:
-        result.extend(unsupported_nodes(child))
-    return result
-
-clean = []
-unsupported = Counter()
-for query in run.get("query_list", []):
-    if not check_valid(ExecutionMode.JSON_OUTPUT, query, min_runtime=100, verbose=False):
-        continue
-    analyze = query["analyze_plans"][0]
-    if float(analyze.get("Execution Time", 0)) > 30000:
-        continue
-    bad = unsupported_nodes(analyze["Plan"])
-    if bad:
-        unsupported.update(bad)
-        continue
-    clean.append(query)
-
-if not clean:
-    raise SystemExit("清洗后没有可用查询")
-
-result = copy.deepcopy(run)
-result["query_list"] = clean
-os.makedirs(os.path.dirname(target), exist_ok=True)
-with open(target, "w") as file:
-    json.dump(result, file)
-
-print("raw queries:", len(run.get("query_list", [])))
-print("clean queries:", len(clean))
-print("filtered unsupported operators:", dict(unsupported))
-print("saved:", target)
-PY
-```
-
-作用：去掉 SQL 执行错误、超时、空计划、零基数、小于 100ms、大于 30000ms 的查询，并过滤当前 QPP-Net 不支持的算子。
-
-产物：`data/json_complex_clean/<db>/complex_workload_200k_s1.json`。
-
-### 7.2 生成 QPP-Net feature statistics
-
-```bash
-export QPP_STATS="$STATS_ROOT/qppnet/$QPP_DB/feature_statistics.json"
-
-cd "$SRC"
-"$PY" - "$QPP_CLEAN" "$QPP_STATS" <<'PY'
-import sys
-from training.preprocessing.feature_statistics import gather_feature_statistics
-
-gather_feature_statistics([sys.argv[1]], sys.argv[2])
-print("saved", sys.argv[2])
-PY
-```
-
-作用：从清洗后的 JSON 计划生成 QPP-Net 的数值缩放和类别编码信息。
-
-### 7.3 训练 QPP-Net
-
-```bash
-export SEED=0
-export COLUMN_STATS="$SRC/cross_db_benchmark/datasets/$QPP_DB/column_statistics.json"
-
-mkdir -p "$MODEL_ROOT/qppnet/$QPP_DB" "$EVAL_ROOT/qppnet/$QPP_DB"
+export MODEL_DIR="$LCM_ROOT/data/models/qpp_native/qppnet/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/qpp_native/qppnet/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
 
 cd "$SRC"
 set -o pipefail
-"$PY" main.py \
-  --mode train \
-  --model_type qppnet \
-  --device cpu \
-  --model_dir "$MODEL_ROOT/qppnet/$QPP_DB" \
-  --target_dir "$EVAL_ROOT/qppnet/$QPP_DB" \
+"$PY" main.py --mode train --model_type qppnet --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
   --statistics_file "$QPP_STATS" \
   --column_statistics "$COLUMN_STATS" \
-  --workload_runs "$QPP_CLEAN" \
-  --num_workers 0 \
-  --seed "$SEED" \
-  2>&1 | tee "$EVAL_ROOT/qppnet/$QPP_DB/train_seed_${SEED}.log"
+  --workload_runs "$JSON_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol qpp_native \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
 ```
 
-作用：在当前数据库的 clean JSON 上训练 QPP-Net，并自动执行 80/10/10 切分和内部测试。
+Native 结果反映各自原生可用范围；QPP-Net 结果必须连同 coverage 报告，不能直接作为严格 matched 对比。
 
-主要产物：
+### 6.4 Strict matched 训练
+
+严格比较时，三个模型都使用 `--experiment_protocol matched`，并使用独立模型/结果目录重新训练：
 
 ```text
-data/models/qppnet/<db>/qppnet_0.pt
-data/evaluation/qppnet/<db>/complex_workload_200k_s1_0_test_pred.csv
-data/evaluation/qppnet/<db>/complex_workload_200k_s1_0_test_stats.csv
+data/models/matched/e2e/<db>
+data/models/matched/query_former/<db>
+data/models/matched/qppnet/<db>
+data/evaluation/matched/e2e/<db>
+data/evaluation/matched/query_former/<db>
+data/evaluation/matched/qppnet/<db>
 ```
 
-完成 IMDB 后，把 `QPP_DB` 改为 `tpc_h_pk`，重复第 7.1～7.3 节。先 seed 0，再 seed 1、2。
+输入仍然是：
 
-## 8. 如何确认训练成功
-
-查看 checkpoint：
-
-```bash
-find "$MODEL_ROOT" -type f -name '*.pt' -print | sort
+```text
+E2E/QueryFormer：BASELINE_MASTER
+QPP-Net：JSON_MASTER
 ```
 
-作用：列出已保存的模型。每个模型/数据库/seed 应该有一个 `.pt` 文件。
+三个 dataloader 都会在原 master split 内应用同一 QPP support mask。不能复用第 6.3 节使用完整 baseline train 训练出的 E2E/QueryFormer checkpoint。
 
-查看内部测试结果：
+#### 6.4.1 Matched E2E
 
 ```bash
-find "$EVAL_ROOT" -type f -name '*_test_*.csv' -print | sort
+export MODEL_DIR="$LCM_ROOT/data/models/matched/e2e/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/e2e/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
+
+cd "$SRC"
+set -o pipefail
+"$PY" main.py --mode train --model_type e2e --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
+  --statistics_file "$BASELINE_STATS" \
+  --column_statistics "$COLUMN_STATS" \
+  --word_embeddings "$WORD2VEC" \
+  --workload_runs "$BASELINE_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol matched \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
 ```
 
-作用：列出训练结束后自动生成的测试 CSV。
-
-- `*_test_pred.csv`：每条查询的真实运行时间、预测时间和 Q-error。
-- `*_test_stats.csv`：RMSE、MAPE、Q-error percentile 等汇总结果。
-- `train_seed_*.log`：训练过程和报错信息。
-
-`main.py --mode train` 已自动测试，所以第一轮不需要再单独执行 `--mode predict`。只有将来收集了独立 evaluation workload，才需要再用 predict。
-
-## 9. 后续训练 Zero-Shot 和 DACE
-
-Zero-Shot 和 DACE 是 workload-agnostic 模型。对每个目标库，它们使用其余 19 库训练，并把目标库的整个 workload 作为测试集。它们只读取 standard parsed，不需要 sample bitmap、CSV 或 word2vec。
-
-目前 6 个数据库还没有收集完成，因此本节命令留到 20 库全部收齐后执行。
-
-### 9.1 检查 20 库 raw
+#### 6.4.2 Matched QueryFormer
 
 ```bash
-ALL_DBS=(
-  accidents airline baseball basketball carcinogenesis consumer
-  credit employee fhnk financial geneea genome hepatitis imdb
-  movielens seznam ssb tournament tpc_h_pk walmart
-)
+export MODEL_DIR="$LCM_ROOT/data/models/matched/query_former/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/query_former/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
 
-missing=0
-for db in "${ALL_DBS[@]}"; do
-  file="$RAW_ROOT/$db/complex_workload_200k_s1.json"
-  if [[ -s "$file" ]]; then
-    echo "OK      $db"
-  else
-    echo "MISSING $db"
-    missing=1
-  fi
-done
-if [[ "$missing" -ne 0 ]]; then
-  echo "20 库未收齐，请不要继续第 9.2 节"
-fi
+cd "$SRC"
+set -o pipefail
+"$PY" main.py --mode train --model_type query_former --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
+  --statistics_file "$BASELINE_STATS" \
+  --column_statistics "$COLUMN_STATS" \
+  --word_embeddings "$WORD2VEC" \
+  --workload_runs "$BASELINE_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol matched \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
 ```
 
-作用：只读检查官方列表中的 20 个 raw 文件。必须全部显示 `OK`。
-
-### 9.2 生成 20 库 standard parsed
+#### 6.4.3 Matched QPP-Net
 
 ```bash
-mkdir -p "$STANDARD_ROOT"
+export MODEL_DIR="$LCM_ROOT/data/models/matched/qppnet/$DB"
+export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/qppnet/$DB"
+mkdir -p "$MODEL_DIR" "$EVAL_DIR"
 
+cd "$SRC"
+set -o pipefail
+"$PY" main.py --mode train --model_type qppnet --device cpu \
+  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
+  --statistics_file "$QPP_STATS" \
+  --column_statistics "$COLUMN_STATS" \
+  --workload_runs "$JSON_MASTER" \
+  --split_manifest "$SPLIT" \
+  --alignment_manifest "$ALIGNMENT" \
+  --experiment_protocol matched \
+  --num_workers 0 --seed "$SEED" \
+  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
+```
+
+### 6.5 验证 strict matched 结果
+
+三个模型都完成后：
+
+```bash
+cd "$SRC"
+"$PY" evaluation/aligned_metrics.py \
+  --alignment_manifest "$ALIGNMENT" \
+  --split_manifest "$SPLIT" \
+  --prediction "e2e=$LCM_ROOT/data/evaluation/matched/e2e/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv" \
+  --prediction "query_former=$LCM_ROOT/data/evaluation/matched/query_former/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv" \
+  --prediction "qppnet=$LCM_ROOT/data/evaluation/matched/qppnet/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv"
+```
+
+工具会拒绝 query ID 缺失、额外或不一致的结果，并分别基于模型自己的标签计算 Q-error：
+
+- E2E/QueryFormer label 是 raw runtime；
+- QPP-Net label 是 JSON runtime；
+- 不要求两种 label 数值相同。
+
+
+## 7. Zero-Shot、DACE 跨库训练
+
+Zero-Shot/DACE 不直接读取 raw，而是读取 standard parsed。对于 IMDB/TPC-H-PK，新 paired raw 与旧 raw 的核心格式相同，所以可以和其余 18 库一起转换和跨库训练。
+
+这两个模型沿用原来的 workload-agnostic 协议：每次选择一个目标库，其余 19 库训练，目标库整个 standard workload 测试。不要给下面的命令传 `--split_manifest`、`--alignment_manifest` 或 `--experiment_protocol`。
+
+由于 IMDB 和 TPC-H-PK 同时属于这 20 库，无论哪个是测试目标，训练集合或测试集合都发生了变化，所以 Zero-Shot 和 DACE 的两个目标库、三个 seed 都必须重新训练。下面使用新的 `cross_db_paired` 模型目录，避免程序误加载旧 checkpoint。
+
+### 7.1 检查 20 库 raw
+
+执行第 4 节中的 `ALL_DBS`、`raw_source` 和检查命令。全部为 `OK` 后继续。
+
+### 7.2 生成并审核 20 库 standard parsed
+
+```bash
 for db in "${ALL_DBS[@]}"; do
   expected=5000
-  if [[ "$db" == imdb || "$db" == tpc_h_pk ]]; then
-    expected=10000
-  fi
+  [[ "$db" == imdb || "$db" == tpc_h_pk ]] && expected=10000
 
-  source="$RAW_ROOT/$db/complex_workload_200k_s1.json"
+  source=$(raw_source "$db")
   target="$STANDARD_ROOT/$db/complex_workload_200k_s1.json"
   mkdir -p "$(dirname "$target")"
 
   cd "$SRC"
-  "$PY" run_benchmark.py \
-    --parse_run \
+  "$PY" run_benchmark.py --parse_run \
     --source "$source" \
     --target "$target" \
     --parse_join_conds \
@@ -647,21 +531,48 @@ for db in "${ALL_DBS[@]}"; do
 
   count=$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parsed_plans"]))' "$target")
   echo "$db: $count/$expected"
-  if [[ "$count" -ne "$expected" ]]; then
-    echo "$db 转换后不足 $expected 条，请数据负责人补采后重新转换"
-    break
-  fi
 done
 ```
 
-作用：将 20 库 raw 转成 Zero-Shot/DACE 共用的 standard parsed。这里没有 `--parse_baseline`；不要使用 E2E/QueryFormer 的 `parsed_complex_baseline` 代替。
+预期数量：
 
-数量要求：IMDB、TPC-H-PK 各 10000 条，其他 18 库各 5000 条。这样无论以 IMDB 还是 TPC-H-PK 为目标，剩余 19 库都正好提供约 100000 条训练计划。如果某库因 `SubPlan/InitPlan` 被跳过而不足目标数量，应先补采，不能继续训练。
+```text
+其余 18 库：各 5,000 条
+IMDB：10,000 条
+TPC-H-PK：10,000 条
+```
 
-### 9.3 生成统一的 combined feature statistics
+对 IMDB/TPC-H-PK 做 standard parse 时不检查 `pair_valid`，只应用和其余 18 库相同的 raw-side 规则。否则会形成“18 库 raw-only、2 库 raw+JSON”的不一致跨库筛选。
+
+### 7.3 某个旧库 parse 后数量不足时
+
+不删除旧文件，也不从头重采。在原收集服务器和原数据库环境中提高总 cap，collector 会跳过已有 SQL 并继续采集。例如某个普通库原 cap 为 5,000：
 
 ```bash
-export COMBINED_STATS="$STANDARD_ROOT/statistics_complex_workload_combined.json"
+export DB=credit
+export NEW_RAW_CAP=5500
+export RAW_TARGET="$RAW_ROOT/$DB/complex_workload_200k_s1.json"
+
+cd "$SRC"
+"$PY" run_benchmark.py --run_workload \
+  --source "$LCM_ROOT/data/workloads/training/$DB/complex_workload_200k_s1.sql" \
+  --db_name "$DB" \
+  --target "$RAW_TARGET" \
+  --database_conn user=postgres,host=localhost \
+  --mode raw \
+  --query_timeout 30 \
+  --repetitions_per_query 1 \
+  --min_query_ms 100 \
+  --cap_workload "$NEW_RAW_CAP"
+```
+
+补采后只重跑该库的第 7.2 节转换。若仍不足，继续把 `NEW_RAW_CAP` 每次增加 200～500。对于 IMDB/TPC-H-PK，不使用这个普通 raw 命令，应回到 `COLLECTION_GUIDE.md` 的 paired 命令同时续采 raw/JSON。
+
+
+### 7.4 生成统一的 combined feature statistics
+
+```bash
+export COMBINED_STATS="$STANDARD_ROOT/statistics_complex_workload_paired_v2.json"
 
 STANDARD_RUNS=()
 for db in "${ALL_DBS[@]}"; do
@@ -685,7 +596,7 @@ PY
 
 这里包含目标库的 stats，但目标库计划不会进入模型参数训练。原因是当前 Zero-Shot 实现没有 unknown-category 编码；如果 stats 只看其余 19 库，目标库出现新的算子或数据类型时会直接报错。这也是项目训练脚本使用 combined stats 的方式。
 
-### 9.4 选择目标库并构造 19/1 输入
+### 7.5 选择目标库并构造 19/1 输入
 
 先训练 IMDB：
 
@@ -722,7 +633,7 @@ echo "test workload: $TEST_RUN"
 
 作用：自动排除当前目标库，避免手工书写 19 个路径时把目标库误放进训练集。
 
-### 9.5 训练 Zero-Shot
+### 7.6 训练 Zero-Shot
 
 以当前 `TARGET_DB`、seed 0 为例：
 
@@ -730,7 +641,9 @@ echo "test workload: $TEST_RUN"
 export SEED=0
 export ZS_HPARAM="$SRC/conf/zeroshot_hyperparameters/tune_est_best_config.json"
 
-mkdir -p "$MODEL_ROOT/zeroshot/$TARGET_DB" "$EVAL_ROOT/zeroshot/$TARGET_DB"
+export ZS_MODEL_DIR="$MODEL_ROOT/cross_db_paired/zeroshot/$TARGET_DB"
+export ZS_EVAL_DIR="$EVAL_ROOT/cross_db_paired/zeroshot/$TARGET_DB"
+mkdir -p "$ZS_MODEL_DIR" "$ZS_EVAL_DIR"
 
 cd "$SRC"
 set -o pipefail
@@ -738,20 +651,20 @@ set -o pipefail
   --mode train \
   --model_type zeroshot \
   --device cpu \
-  --model_dir "$MODEL_ROOT/zeroshot/$TARGET_DB" \
-  --target_dir "$EVAL_ROOT/zeroshot/$TARGET_DB" \
+  --model_dir "$ZS_MODEL_DIR" \
+  --target_dir "$ZS_EVAL_DIR" \
   --statistics_file "$COMBINED_STATS" \
   --hyperparameter_path "$ZS_HPARAM" \
   --workload_runs "${TRAIN_RUNS[@]}" \
   --test_workload_runs "$TEST_RUN" \
   --num_workers 0 \
   --seed "$SEED" \
-  2>&1 | tee "$EVAL_ROOT/zeroshot/$TARGET_DB/train_seed_${SEED}.log"
+  2>&1 | tee "$ZS_EVAL_DIR/train_seed_${SEED}.log"
 ```
 
 作用：将 19 库合并后按 80%/20% 分成训练集和验证集；训练结束后，在目标库整个 workload 上测试。Zero-Shot 必须显式使用仓库中实际存在的 `conf/zeroshot_hyperparameters/tune_est_best_config.json`。
 
-### 9.6 检查并训练 DACE
+### 7.7 检查并训练 DACE
 
 DACE 默认配置假设 stats 中恰好有 20 种 `op_name`，即每个节点是“20 维算子 one-hot + `est_cost` + `est_card`”，所以默认 `node_length=22`；同时默认每个计划最多 22 个节点。先检查本次数据：
 
@@ -786,7 +699,7 @@ PY
 
 - 如果 `required DACE node_length` 是 22 且 `required DACE pad_length` 是 22，可直接使用默认配置。
 - 如果不是 22，必须先在 `src/classes/classes.py` 的 `DACEModelConfig` 中，将 `node_length` 和 `pad_length` 分别改成命令打印的值。两个目标库和三个 seed 必须使用完全相同的数值。
-- 当前 IMDB 和 TPC-H-PK 已经观察到 21 种算子，因此最终 combined stats 很可能要求 `node_length=23`。必须以 20 库全部转换后的检查结果为准。该修改是为了让 DACE 兼容本次新数据；如果坚持论文旧环境的默认结构，则应保留 22 并停止本次 DACE 实验，不能用错位特征训练。
+- 不预设新数据最终有多少种算子，必须以这段检查命令的实际输出为准。
 
 修改后可以用下面的命令确认代码实际采用的值：
 
@@ -800,7 +713,9 @@ cd "$SRC"
 ```bash
 export SEED=0
 
-mkdir -p "$MODEL_ROOT/dace/$TARGET_DB" "$EVAL_ROOT/dace/$TARGET_DB"
+export DACE_MODEL_DIR="$MODEL_ROOT/cross_db_paired/dace/$TARGET_DB"
+export DACE_EVAL_DIR="$EVAL_ROOT/cross_db_paired/dace/$TARGET_DB"
+mkdir -p "$DACE_MODEL_DIR" "$DACE_EVAL_DIR"
 
 cd "$SRC"
 set -o pipefail
@@ -808,447 +723,78 @@ set -o pipefail
   --mode train \
   --model_type dace \
   --device cpu \
-  --model_dir "$MODEL_ROOT/dace/$TARGET_DB" \
-  --target_dir "$EVAL_ROOT/dace/$TARGET_DB" \
+  --model_dir "$DACE_MODEL_DIR" \
+  --target_dir "$DACE_EVAL_DIR" \
   --statistics_file "$COMBINED_STATS" \
   --workload_runs "${TRAIN_RUNS[@]}" \
   --test_workload_runs "$TEST_RUN" \
   --num_workers 0 \
   --seed "$SEED" \
-  2>&1 | tee "$EVAL_ROOT/dace/$TARGET_DB/train_seed_${SEED}.log"
+  2>&1 | tee "$DACE_EVAL_DIR/train_seed_${SEED}.log"
 ```
 
 作用：与 Zero-Shot 使用相同的 19 库训练、目标库整库测试口径，但使用 DACE 模型。
 
-### 9.7 训练顺序和产物
+### 7.8 训练顺序和产物
 
-先分别跑通 `imdb seed 0` 和 `tpc_h_pk seed 0`，确认测试 CSV 正常生成后，再跑 seed 1、2。每次更换目标库都要重新执行第 9.4 节，重新构造对应的 `TRAIN_RUNS` 和 `TEST_RUN`。
+先分别跑通 `imdb seed 0` 和 `tpc_h_pk seed 0`，确认测试 CSV 正常生成后，再跑 seed 1、2。每次更换目标库都要重新执行第 7.5 节，重新构造对应的 `TRAIN_RUNS` 和 `TEST_RUN`。
 
 主要产物：
 
 ```text
-data/models/zeroshot/<target_db>/zeroshot_<seed>.pt
-data/models/dace/<target_db>/dace_<seed>.pt
-data/evaluation/zeroshot/<target_db>/complex_workload_200k_s1_<seed>_test_pred.csv
-data/evaluation/zeroshot/<target_db>/complex_workload_200k_s1_<seed>_test_stats.csv
-data/evaluation/dace/<target_db>/complex_workload_200k_s1_<seed>_test_pred.csv
-data/evaluation/dace/<target_db>/complex_workload_200k_s1_<seed>_test_stats.csv
+data/models/cross_db_paired/zeroshot/<target_db>/zeroshot_<seed>.pt
+data/models/cross_db_paired/dace/<target_db>/dace_<seed>.pt
+data/evaluation/cross_db_paired/zeroshot/<target_db>/complex_workload_200k_s1_<seed>_test_pred.csv
+data/evaluation/cross_db_paired/zeroshot/<target_db>/complex_workload_200k_s1_<seed>_test_stats.csv
+data/evaluation/cross_db_paired/dace/<target_db>/complex_workload_200k_s1_<seed>_test_pred.csv
+data/evaluation/cross_db_paired/dace/<target_db>/complex_workload_200k_s1_<seed>_test_stats.csv
 ```
 
-## 10. `LCM-Reproduction-Script` 怎么使用
+## 8. 如何确认训练成功
 
-`LCM-Reproduction-Script` 对本次工作的作用是：
-
-- 参考已验证的 CPU 依赖版本；
-- 参考 `main.py` 的训练参数；
-- 参考 workload-driven 的 80/10/10 和 workload-agnostic 的 19/1 训练方式。
-
-不要在本次新数据上直接执行：
+查看 checkpoint：
 
 ```bash
-bash reproduce.sh train
+find "$MODEL_ROOT" -type f -name '*.pt' -print | sort
 ```
 
-原因是该脚本使用它自己目录下的官方 OSF/c8220 数据，并且固定读取 `workload_100k_s1_c8220.json`，不会自动读取本指南的 `raw_complex`、`json_complex` 和 `complex_workload_200k_s1.json`。
+作用：列出已保存的模型。每个模型/数据库/seed 应该有一个 `.pt` 文件。
 
-## 11. 为什么没有直接照抄项目 README
+查看内部测试结果：
 
-项目 README 描述的总流程是对的：解析数据、生成 sample bitmap、生成 feature statistics、调用 `main.py`。但当前代码与 README 有几个不一致：
+```bash
+find "$EVAL_ROOT" -type f -name '*_test_*.csv' -print | sort
+```
 
-- README 中的 `gather_feature_statistics.py` 文件不存在；
-- `gather_feature_stats.py` 只会拼接旧 `data/runs/json` 目录；
-- `baseline.py` 启动时会导入一个不存在的模块；
-- `parse_all.py` 当前把 `min_query_ms` 写死为 0。
+作用：列出训练结束后自动生成的测试 CSV。
 
-本次实际解析还修正了 `parse_filter.py` 对新版本 PostgreSQL `= ANY (...)` 表达式的识别问题，并通过了现有 filter parsing 测试。训练机应使用当前工作区中的同版源码。
+- `*_test_pred.csv`：每条查询的真实运行时间、预测时间和 Q-error。
+- `*_test_stats.csv`：RMSE、MAPE、Q-error percentile 等汇总结果。
+- `train_seed_*.log`：训练过程和报错信息。
 
-所以本指南使用 `run_benchmark.py --parse_run` 和底层 Python 函数，但整体流程仍然与 README 一致。
+`main.py --mode train` 会在训练结束后自动测试，因此不需要再单独执行 `--mode predict`。只有将来收集了独立 evaluation workload，才需要再用 predict。
 
-## 12. 执行顺序总结
 
-1. 所有人执行第 3 节，准备 CPU 环境。
-2. 房子珈对 imdb、tpc_h_pk 各执行一次第 4 节共享预处理。
-3. 房子珈执行第 5 节，训练 E2E。
-4. 李昊森复用共享产物，执行第 6 节，训练 QueryFormer。
-5. 何沅东对 imdb、tpc_h_pk 分别执行第 7 节，训练 QPP-Net。
-6. 所有人用第 8 节的两条 `find` 命令检查 checkpoint 和测试 CSV。
-7. 等 6 个缺失数据库全部收齐后，按第 9.1～9.3 节生成 20 库 standard parsed 和 combined stats。
-8. 分别以 imdb、tpc_h_pk 为目标库，按第 9.4～9.7 节训练和测试 Zero-Shot、DACE。
+## 9. 结果口径与执行顺序
 
-建议实验顺序：
+### 9.1 当前可以直接比较的结果
 
 ```text
-imdb seed 0 跑通
-  → tpc_h_pk seed 0
-  → 检查所有 test CSV
-  → seed 1
-  → seed 2
+单库 native：报告 E2E/QueryFormer 全 master 结果，以及 QPP-Net coverage 后的自身结果
+单库 strict matched：三个单库模型在完全相同 query ID 上重新训练和测试
+跨库 19/1：Zero-Shot/DACE 使用相同的 20 库 standard parsed 口径
 ```
 
-
-# 第二部分：Paired 对齐后的当前单库训练流程
-
-本指南训练 E2E、QueryFormer 和 QPP-Net。数据必须先按 `COLLECTION_GUIDE.md` 生成 baseline master、JSON master、alignment manifest 和 split。
-
-## 1. 公共环境
-
-```bash
-export LCM_ROOT=/data/workspace/lcm-eval
-export SRC="$LCM_ROOT/src"
-export PY="$LCM_ROOT/.venv/bin/python"
-export PYTHONPATH="$SRC"
-export RAW_ROOT="$LCM_ROOT/data/raw_complex"
-export JSON_ROOT="$LCM_ROOT/data/json_complex"
-export STANDARD_ROOT="$LCM_ROOT/data/parsed_complex"
-export MODEL_ROOT="$LCM_ROOT/data/models"
-export EVAL_ROOT="$LCM_ROOT/data/evaluation"
-export PYTHONHASHSEED=0
-export DGLBACKEND=pytorch
-export WANDB_MODE=disabled
-export OMP_NUM_THREADS=4
-export MKL_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
-
-NODE_ENV='{"hostname":"localhost","python":"3.10"}'
-export NODE00="$NODE_ENV" NODE01="$NODE_ENV" NODE02="$NODE_ENV"
-export NODE03="$NODE_ENV" NODE04="$NODE_ENV" NODE05="$NODE_ENV"
-```
-
-选择数据库和 seed：
-
-```bash
-export DB=imdb       # 或 tpc_h_pk
-export SEED=0        # 之后运行1、2
-
-export BASELINE_MASTER="$LCM_ROOT/data/augmented_baseline_master/$DB/complex_workload_200k_s1.json"
-export JSON_MASTER="$LCM_ROOT/data/json_master/$DB/complex_workload_200k_s1.json"
-export ALIGN_DIR="$LCM_ROOT/data/alignment/$DB/complex_workload_200k_s1"
-export ALIGNMENT="$ALIGN_DIR/manifest.json"
-export SPLIT="$ALIGN_DIR/splits/seed_$SEED.json"
-export COLUMN_STATS="$SRC/cross_db_benchmark/datasets/$DB/column_statistics.json"
-export SENTENCES="$LCM_ROOT/data/sentences/aligned/$DB/sentences.json"
-export WORD2VEC="$LCM_ROOT/data/sentences/aligned/$DB/word2vec.m"
-export BASELINE_STATS="$LCM_ROOT/data/feature_statistics/aligned_baseline/$DB/feature_statistics.json"
-export QPP_STATS="$LCM_ROOT/data/feature_statistics/aligned_qpp/$DB/feature_statistics.json"
-```
-
-## 2. 生成公共预处理资源
-
-### 2.1 sentences 和 word2vec
-
-TPC-H-PK 的 CSV 目录是 `tpc_h`：
-
-```bash
-export CSV_DB="$DB"
-[[ "$DB" == "tpc_h_pk" ]] && export CSV_DB=tpc_h
-
-mkdir -p "$(dirname "$SENTENCES")"
-cd "$SRC"
-"$PY" - "$DB" "$BASELINE_MASTER" "$LCM_ROOT/data/datasets/$CSV_DB" "$SENTENCES" <<'PY'
-import sys
-from models.workload_driven.preprocessing.sentence_creation import create_sentences
-
-create_sentences(
-    dataset=sys.argv[1],
-    plan_paths=[sys.argv[2]],
-    data_dir=sys.argv[3],
-    target=sys.argv[4],
-)
-PY
-
-"$PY" - "$SENTENCES" "$WORD2VEC" <<'PY'
-import sys
-from models.workload_driven.preprocessing.word_embeddings import compute_word_embeddings
-compute_word_embeddings(sys.argv[1], sys.argv[2])
-PY
-```
-
-### 2.2 feature statistics
-
-```bash
-cd "$SRC"
-"$PY" - "$BASELINE_MASTER" "$BASELINE_STATS" "$JSON_MASTER" "$QPP_STATS" <<'PY'
-import sys
-from training.preprocessing.feature_statistics import gather_feature_statistics
-
-baseline, baseline_stats, json_master, qpp_stats = sys.argv[1:]
-gather_feature_statistics([baseline], baseline_stats)
-gather_feature_statistics([json_master], qpp_stats)
-PY
-```
-
-## 3. 查看 QPP-Net coverage
-
-```bash
-cd "$SRC"
-"$PY" evaluation/aligned_metrics.py \
-  --alignment_manifest "$ALIGNMENT" \
-  --split_manifest "$SPLIT"
-```
-
-它会分别输出 train、validation、test 中 QPP-Net 支持的数量和比例。
-
-## 4. Native 训练
-
-### 4.1 E2E
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/baseline_native/e2e/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/baseline_native/e2e/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type e2e --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$BASELINE_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --word_embeddings "$WORD2VEC" \
-  --workload_runs "$BASELINE_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol baseline_native \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-### 4.2 QueryFormer
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/baseline_native/query_former/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/baseline_native/query_former/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type query_former --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$BASELINE_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --word_embeddings "$WORD2VEC" \
-  --workload_runs "$BASELINE_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol baseline_native \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-### 4.3 QPP-Net
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/qpp_native/qppnet/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/qpp_native/qppnet/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type qppnet --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$QPP_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --workload_runs "$JSON_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol qpp_native \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-Native 结果反映各自原生可用范围；QPP-Net 结果必须连同 coverage 报告，不能直接作为严格 matched 对比。
-
-## 5. Strict matched 训练
-
-严格比较时，三个模型都使用 `--experiment_protocol matched`，并使用独立模型/结果目录重新训练：
-
-```text
-data/models/matched/e2e/<db>
-data/models/matched/query_former/<db>
-data/models/matched/qppnet/<db>
-data/evaluation/matched/e2e/<db>
-data/evaluation/matched/query_former/<db>
-data/evaluation/matched/qppnet/<db>
-```
-
-输入仍然是：
-
-```text
-E2E/QueryFormer：BASELINE_MASTER
-QPP-Net：JSON_MASTER
-```
-
-三个 dataloader 都会在原 master split 内应用同一 QPP support mask。不能复用第 4 节使用完整 baseline train 训练出的 E2E/QueryFormer checkpoint。
-
-### 5.1 Matched E2E
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/matched/e2e/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/e2e/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type e2e --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$BASELINE_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --word_embeddings "$WORD2VEC" \
-  --workload_runs "$BASELINE_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol matched \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-### 5.2 Matched QueryFormer
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/matched/query_former/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/query_former/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type query_former --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$BASELINE_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --word_embeddings "$WORD2VEC" \
-  --workload_runs "$BASELINE_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol matched \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-### 5.3 Matched QPP-Net
-
-```bash
-export MODEL_DIR="$LCM_ROOT/data/models/matched/qppnet/$DB"
-export EVAL_DIR="$LCM_ROOT/data/evaluation/matched/qppnet/$DB"
-mkdir -p "$MODEL_DIR" "$EVAL_DIR"
-
-cd "$SRC"
-set -o pipefail
-"$PY" main.py --mode train --model_type qppnet --device cpu \
-  --model_dir "$MODEL_DIR" --target_dir "$EVAL_DIR" \
-  --statistics_file "$QPP_STATS" \
-  --column_statistics "$COLUMN_STATS" \
-  --workload_runs "$JSON_MASTER" \
-  --split_manifest "$SPLIT" \
-  --alignment_manifest "$ALIGNMENT" \
-  --experiment_protocol matched \
-  --num_workers 0 --seed "$SEED" \
-  2>&1 | tee "$EVAL_DIR/train_seed_${SEED}.log"
-```
-
-## 6. 验证 strict matched 结果
-
-三个模型都完成后：
-
-```bash
-cd "$SRC"
-"$PY" evaluation/aligned_metrics.py \
-  --alignment_manifest "$ALIGNMENT" \
-  --split_manifest "$SPLIT" \
-  --prediction "e2e=$LCM_ROOT/data/evaluation/matched/e2e/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv" \
-  --prediction "query_former=$LCM_ROOT/data/evaluation/matched/query_former/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv" \
-  --prediction "qppnet=$LCM_ROOT/data/evaluation/matched/qppnet/$DB/complex_workload_200k_s1_${SEED}_test_pred.csv"
-```
-
-工具会拒绝 query ID 缺失、额外或不一致的结果，并分别基于模型自己的标签计算 Q-error：
-
-- E2E/QueryFormer label 是 raw runtime；
-- QPP-Net label 是 JSON runtime；
-- 不要求两种 label 数值相同。
-
-## 7. 执行顺序
-
-```text
-IMDB seed 0 native跑通
-→ IMDB seed 0 matched跑通并验证ID
-→ TPC-H-PK seed 0重复
-→ seed 1、2
-→ 汇总三个seed和coverage
-```
-
-## 8. Paired 对齐后，Zero-Shot / DACE 跨库命令怎么改
-
-Zero-Shot 和 DACE 的训练协议仍是第一部分第 9 节的“其余 19 库训练、目标库测试”。它们只使用 raw 经 standard parse 得到的数据，不读取 JSON master、sample bitmap 或 word2vec，也不要传 `--split_manifest`、`--alignment_manifest`、`--experiment_protocol`。
-
-变化只有两点：
-
-- 其余 18 库继续读取原来的 `complex_workload_200k_s1.json`；
-- IMDB 和 TPC-H-PK 改为读取本次重新收集的 `complex_workload_200k_s1_paired.json`。
-
-### 8.1 检查 20 库 raw
-
-```bash
-ALL_DBS=(
-  accidents airline baseball basketball carcinogenesis consumer
-  credit employee fhnk financial geneea genome hepatitis imdb
-  movielens seznam ssb tournament tpc_h_pk walmart
-)
-
-raw_source() {
-  local db="$1"
-  if [[ "$db" == imdb || "$db" == tpc_h_pk ]]; then
-    printf '%s\n' "$RAW_ROOT/$db/complex_workload_200k_s1_paired.json"
-  else
-    printf '%s\n' "$RAW_ROOT/$db/complex_workload_200k_s1.json"
-  fi
-}
-
-missing=0
-for db in "${ALL_DBS[@]}"; do
-  source=$(raw_source "$db")
-  if [[ -s "$source" ]]; then
-    echo "OK      $db  $source"
-  else
-    echo "MISSING $db  $source"
-    missing=1
-  fi
-done
-[[ "$missing" -eq 0 ]] || { echo '20 库未收齐，停止'; false; }
-```
-
-### 8.2 重新生成 20 库 standard parsed
-
-```bash
-for db in "${ALL_DBS[@]}"; do
-  expected=5000
-  [[ "$db" == imdb || "$db" == tpc_h_pk ]] && expected=10000
-
-  source=$(raw_source "$db")
-  target="$STANDARD_ROOT/$db/complex_workload_200k_s1.json"
-  mkdir -p "$(dirname "$target")"
-
-  cd "$SRC"
-  "$PY" run_benchmark.py --parse_run \
-    --source "$source" \
-    --target "$target" \
-    --parse_join_conds \
-    --min_query_ms 100 \
-    --max_query_ms 30000 \
-    --cap_queries "$expected"
-
-  count=$("$PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["parsed_plans"]))' "$target")
-  echo "$db: $count/$expected"
-  [[ "$count" -eq "$expected" ]] || { echo "$db standard parsed 数量不正确"; false; break; }
-done
-```
-
-这一步对 20 个库统一执行 raw-side 规则。IMDB/TPC-H-PK 文件里新增的 `query_id`、paired runtime 和指纹只是附加元数据，standard parser 和 Zero-Shot/DACE 会忽略不使用的字段。不要对这两个库额外要求 `pair_valid`，否则会形成“18 库 raw-only、2 库 raw+JSON”的不一致跨库筛选。
-
-完成后继续执行第一部分第 9.3～9.7 节：生成 combined feature statistics、构造 `TRAIN_RUNS`/`TEST_RUN`、训练 Zero-Shot 和 DACE。对应的 `main.py` 命令本身不需要增加任何 paired/alignment 参数。
-
-### 8.3 两种实验结果不要混称
-
-```text
-第二部分第 4～6 节：E2E / QueryFormer / QPP-Net 单库对齐实验
-第一部分第 9 节：Zero-Shot / DACE 原论文式 19/1 跨库实验
-```
-
-19/1 跨库实验默认测试目标库整个 standard workload，不等于第二部分固定 split 中的 1,000 条 test，也不属于 strict matched 比较。若要把 Zero-Shot/DACE 也纳入五模型完全相同 query ID 的 strict matched 测试，需要另行给 workload-agnostic test loader 增加 manifest 过滤；当前命令没有假装做到这一点。
+Zero-Shot/DACE 的原始 19/1 命令测试目标库整个 standard workload，不等于单库固定 split 的 1,000 条 test，因此不能把它叫作五模型 strict matched。若后续要求五个模型测试 query ID 完全一致，还需要继续修改 workload-agnostic test loader；本指南没有把尚未实现的能力写成已实现。
+
+### 9.2 推荐执行顺序
+
+1. 对 IMDB 执行 paired 收集和 master 检查；
+2. 执行 IMDB seed 0 的 native 与 strict matched 单库训练；
+3. 对 TPC-H-PK 重复以上步骤；
+4. seed 0 全部跑通后再执行 seed 1、2；
+5. 对 20 库执行 standard parse 数量审核；
+6. 只增量补采 standard parsed 不足的旧库；
+7. 固定 combined feature statistics；
+8. 分别以 IMDB、TPC-H-PK 为目标执行 Zero-Shot/DACE 19/1 训练；
+9. 分开汇总单库 native、单库 matched、跨库 19/1 三类结果。
