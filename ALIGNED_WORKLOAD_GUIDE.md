@@ -19,7 +19,7 @@ raw/JSON 都不是零基数
 raw/JSON 规范化后的物理计划完全一致
 ```
 
-baseline master 在 `pair_valid` 基础上继续要求：
+之后在 `pair_valid` 基础上继续要求，形成baseline master样本：
 
 ```text
 不含 InitPlan/SubPlan
@@ -34,7 +34,7 @@ QPP-Net 的算子或编码限制不决定 baseline master。master 固定并划�
 
 ## 2. 代码改动
 
-- `run_benchmark.py`：增加 `--mode paired`、`--raw_target`、`--json_target`。
+- `run_benchmark.py`：增加 `--mode paired（两者一起收集）`、`--raw_target（raw格式的输出目录）`、`--json_target（json格式的输出目录）`。
 - `paired_workload.py`：在同一 SQL 循环中收集 raw/JSON，生成稳定 `query_id`，执行双边 runtime/基数检查并支持断点续采。
 - `plan_fingerprint.py`：统一文本和 JSON 的算子表示并比较物理计划。
 - `parse_plan.py`：把 `query_id` 和 `workload_index` 传递到 parsed plan。

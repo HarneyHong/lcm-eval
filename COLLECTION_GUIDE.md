@@ -1,4 +1,116 @@
-# IMDB / TPC-H-PK 对齐数据收集指南
+# 数据收集与清洗指南（完整保留版）
+
+> 阅读路线：第一部分完整保留原来的下载、普通 raw/JSON 收集、统一 parse、任务分配和注意事项。其余 18 库已有 raw 时无需重采；重新收集 IMDB/TPC-H-PK 时，不执行第一部分的两次独立 raw/JSON 命令，改执行第二部分的 paired 命令。第二部分同时说明如何生成单库对齐 master。
+
+| 任务 | 应执行的章节 |
+| --- | --- |
+| 环境、下载、原任务分配 | 第一部分第 1～3、6 节 |
+| 补采其余 18 库普通 raw | 第一部分第 4 节的 raw 命令 |
+| 重采 IMDB/TPC-H-PK | 第二部分第 1～7 节 |
+| 生成 Zero-Shot/DACE standard parsed | `TRAINING_GUIDE.md` 第二部分第 8 节 |
+
+# 第一部分：原有完整收集流程（legacy/reference）
+
+## 0. 产出（新目录）
+
+
+| 阶段                    | 目录                                                                | 内容                           |
+| --------------------- | ----------------------------------------------------------------- | ---------------------------- |
+| raw                   | `data/raw_complex/<db>/complex_workload_200k_s1.json`             | EXPLAIN ANALYZE 文本（5000 条有效） |
+| parsed                | `data/parsed_complex/<db>/complex_workload_200k_s1.json`          | 标准解析计划                       |
+| baseline              | `data/parsed_complex_baseline/<db>/complex_workload_200k_s1.json` | MSCN/E2E/QueryFormer 用解析     |
+| json（仅 imdb/tpc_h_pk） | `data/json_complex/<db>/complex_workload_200k_s1/...`             | QPP-Net 用                    |
+
+
+## 1. 环境准备
+
+```bash
+git clone git@github.com:HarneyHong/lcm-eval.git
+cd lcm-eval
+python3 -m venv .venv && .venv/bin/pip install -r requirements/requirements.txt
+# 其他：
+# 安装 PostgreSQL
+# .env 里 LOCAL_ROOT_PATH 指向仓库根目录
+```
+
+## 2. 下载数据
+
+```bash
+cd /data/workspace/lcm-eval/src
+../.venv/bin/python download_from_osf.py --artifacts datasets   # -> data/datasets/<db>/*.csv
+../.venv/bin/python download_from_osf.py --artifacts workloads  # -> data/workloads/training/<db>/complex_workload_200k_s1.sql
+```
+
+## 3. 收集数量约定
+
+
+| 库             | cap_workload                             |
+| ------------- | ---------------------------------------- |
+| imdb、tpc_h_pk | **10000**（workload-driven 主目标，对齐论文已发布数据） |
+| 其余所有库         | **5000**                                 |
+
+
+## 4. 收集（每个库两步，每个人收集不同的库）
+
+```bash
+export LCM_ROOT=/data/workspace/lcm-eval
+export PY="$LCM_ROOT/.venv/bin/python"
+export DB=accidents      # 每次改为负责的数据库
+export CSV_DB="$DB"      # tpc_h_pk 例外，应改成 tpc_h
+export CAP=5000          # imdb/tpc_h_pk 为 10000，其余库为 5000
+
+cd "$LCM_ROOT/src"
+# 灌库
+"$PY" run_benchmark.py --load_database \
+  --data_dir "$LCM_ROOT/data/datasets/$CSV_DB" --dataset "$DB" --db_name "$DB" \
+  --database_conn user=postgres,host=localhost
+
+# 收集 raw
+"$PY" run_benchmark.py --run_workload \
+  --source "$LCM_ROOT/data/workloads/training/$DB/complex_workload_200k_s1.sql" --db_name "$DB" \
+  --target "$LCM_ROOT/data/raw_complex/$DB/complex_workload_200k_s1.json" \
+  --database_conn user=postgres,host=localhost --mode raw \
+  --query_timeout 30 --repetitions_per_query 1 --cap_workload "$CAP"
+
+# 旧独立 JSON 流程（仅保留作历史参考；新 IMDB/TPC-H-PK 不再执行）：
+"$PY" run_benchmark.py --run_workload \
+  --source "$LCM_ROOT/data/workloads/training/$DB/complex_workload_200k_s1.sql" --db_name "$DB" \
+  --target "$LCM_ROOT/data/json_complex/$DB/complex_workload_200k_s1/complex_workload_200k_s1.json" \
+  --database_conn user=postgres,host=localhost --mode json \
+  --query_timeout 30 --repetitions_per_query 1 --cap_workload "$CAP"
+```
+
+## 5. 清洗（主机器统一执行）
+
+```bash
+cd "$LCM_ROOT/src"
+"$PY" parse_all.py \
+  --raw_dir "$LCM_ROOT/data/raw_complex" --parsed_plan_dir "$LCM_ROOT/data/parsed_complex" \
+  --parsed_plan_dir_baseline "$LCM_ROOT/data/parsed_complex_baseline" \
+  --workloads complex_workload_200k_s1 --cap_queries 10000
+```
+
+## 6. 任务分配
+
+
+|     | 数据库                                                                |
+| --- | ------------------------------------------------------------------ |
+| 何沅东 | accidents, airline, baseball, basketball, carcinogenesis, consumer |
+| 赵嘉祺 | credit, employee, fhnk, financial, geneea, genome                  |
+| 房子珈 | hepatitis, imdb（10000）, movielens, seznam                          |
+| 李昊森 | ssb, tournament, tpc_h_pk（10000）, walmart                          |
+
+
+每人负责自己库的灌库 + raw 收集（imdb 归房子珈、baseball 归何沅东、tpc_h_pk 归李昊森，这三个需要额外 json 版）；完成后把 `data/raw_complex` 拷到主机器统一 parse。
+
+## 7. 注意
+
+- 200k 池按 cap 收集有效条数（>=100ms、非超时/失败），5000 条约数小时、10000 条约双倍；
+- target 已存在会自动去重续跑，中断可重跑；
+- `query_list` 会保留失败或过快的尝试，因此它的长度通常大于 cap；完成数量应以 parse 后的 `parsed_plans` 为准。
+
+
+# 第二部分：当前 IMDB / TPC-H-PK paired 对齐收集流程
 
 本指南生成 raw/JSON 成对候选以及 E2E/QueryFormer 的 10,000 条 baseline master。设计说明见 `ALIGNED_WORKLOAD_GUIDE.md`。
 
